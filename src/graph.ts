@@ -397,6 +397,22 @@ export function forceLayoutComponent(
       b.vx += fx;
       b.vy += fy;
     }
+    // straight-line alignment for explicit edges — keeps connections straight (vertical/horizontal) to minimize space and stay visible
+    for (const [ai, bi] of edgePairs) {
+      const a = pos[ai]!, b = pos[bi]!;
+      const ax = a.x + a.width / 2, ay = a.y + a.height / 2;
+      const bx = b.x + b.width / 2, by = b.y + b.height / 2;
+      const dx = ax - bx, dy = ay - by;
+      if (Math.abs(dx) < Math.abs(dy)) {
+        const midX = (ax + bx) / 2;
+        const fxA = (ax - midX) * 0.14 * temp, fxB = (bx - midX) * 0.14 * temp;
+        a.vx -= fxA; b.vx -= fxB;
+      } else {
+        const midY = (ay + by) / 2;
+        const fyA = (ay - midY) * 0.14 * temp, fyB = (by - midY) * 0.14 * temp;
+        a.vy -= fyA; b.vy -= fyB;
+      }
+    }
     // context-aware soft attraction for similar cards (year/place/text) — keeps related papers near each other even without explicit edge
     for (let i = 0; i < n; i++) {
       for (let j = i + 1; j < n; j++) {
@@ -589,6 +605,60 @@ export function graphPack(
     const dir = dot >= 0 ? 1 : -1;
     finalNodes = finalNodes.map((n, i) => (i === idx ? { ...n, x: n.x + nx * dir * 42, y: n.y + ny * dir * 42 } as AllCanvasNodeData : n));
     finalEdges = optimizeEdges(finalNodes, finalEdges, opts.optimizeMode ?? "shortest");
+  }
+  // Straight-line pass: try to make edges straight (vertical/horizontal) — each straight edge can be a single segment, combined they minimize bbox
+  function isStraight(a: AllCanvasNodeData, b: AllCanvasNodeData, fs: string, ts: string): boolean {
+    if ((fs === "top" && ts === "bottom") || (fs === "bottom" && ts === "top")) return Math.abs(a.x + a.width / 2 - (b.x + b.width / 2)) < 10;
+    if ((fs === "left" && ts === "right") || (fs === "right" && ts === "left")) return Math.abs(a.y + a.height / 2 - (b.y + b.height / 2)) < 10;
+    return false;
+  }
+  for (let iter = 0; iter < 12; iter++) {
+    let made = false;
+    for (let ei = 0; ei < finalEdges.length; ei++) {
+      const e = finalEdges[ei]!;
+      const a = finalNodes.find((n) => n.id === e.fromNode)!, b = finalNodes.find((n) => n.id === e.toNode)!;
+      if (isStraight(a, b, e.fromSide as string, e.toSide as string)) continue;
+      const ax = a.x + a.width / 2, ay = a.y + a.height / 2, bx = b.x + b.width / 2, by = b.y + b.height / 2;
+      const tryVertical = Math.abs(ax - bx) < Math.abs(ay - by);
+      const candNodes = finalNodes.map((n) => {
+        if (n.id !== b.id) return n;
+        if (tryVertical) return { ...n, x: a.x + (a.width - n.width) / 2 } as AllCanvasNodeData;
+        return { ...n, y: a.y + (a.height - n.height) / 2 } as AllCanvasNodeData;
+      });
+      let overlap = false;
+      for (let i = 0; i < candNodes.length; i++) for (let j = i + 1; j < candNodes.length; j++) {
+        const ca = candNodes[i]!, cb = candNodes[j]!;
+        if (!(ca.x + ca.width + 20 <= cb.x || cb.x + cb.width + 20 <= ca.x || ca.y + ca.height + 20 <= cb.y || cb.y + cb.height + 20 <= ca.y)) { overlap = true; break; }
+      }
+      if (overlap) continue;
+      let hiddenAfter = 0;
+      for (const ce of finalEdges) {
+        const ca = candNodes.find((n) => n.id === ce.fromNode)!, cb = candNodes.find((n) => n.id === ce.toNode)!;
+        const fp = pointForSide(ca, ce.fromSide as EdgeSide), tp = pointForSide(cb, ce.toSide as EdgeSide);
+        for (const n of candNodes) {
+          if (n.id === ce.fromNode || n.id === ce.toNode) continue;
+          if (segmentIntersectsRect(fp.x, fp.y, tp.x, tp.y, n.x, n.y, n.width, n.height)) { hiddenAfter++; break; }
+        }
+      }
+      if (hiddenAfter > 0) continue;
+      const candEdges = optimizeEdges(candNodes, finalEdges, opts.optimizeMode ?? "shortest");
+      let straightBefore = 0, straightAfter = 0;
+      for (const ce of finalEdges) {
+        const ca = finalNodes.find((n) => n.id === ce.fromNode)!, cb = finalNodes.find((n) => n.id === ce.toNode)!;
+        if (isStraight(ca, cb, ce.fromSide as string, ce.toSide as string)) straightBefore++;
+      }
+      for (const ce of candEdges) {
+        const ca = candNodes.find((n) => n.id === ce.fromNode)!, cb = candNodes.find((n) => n.id === ce.toNode)!;
+        if (isStraight(ca, cb, ce.fromSide as string, ce.toSide as string)) straightAfter++;
+      }
+      if (straightAfter > straightBefore) {
+        finalNodes = candNodes;
+        finalEdges = candEdges;
+        made = true;
+        break;
+      }
+    }
+    if (!made) break;
   }
 
   return { nodes: finalNodes, edges: finalEdges };
