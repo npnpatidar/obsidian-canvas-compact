@@ -2,6 +2,39 @@ import type { AllCanvasNodeData, CanvasEdgeData } from "./Canvas.d";
 import type { PackOptions } from "./pack";
 import { maxRectsPack } from "./pack";
 
+// ── Context-aware helpers ──
+function extractYear(text: string): number | null {
+  const m = text.match(/(18|19|20)\d{2}/);
+  return m ? parseInt(m[0], 10) : null;
+}
+const KNOWN_PLACES = ["Ajmer","Jaipur","Jodhpur","Beawer","Bundi","Jaisalmer","Kota","Culcutta","Calcutta","Bombay","Agra","Dungarpur","Bikaner","Udaipur","Alwar","Bharatpur","Kishangarh","Nagaur","Pali","Sikar"];
+function extractPlace(text: string): string | null {
+  for (const p of KNOWN_PLACES) if (text.toLowerCase().includes(p.toLowerCase())) return p;
+  return null;
+}
+function contextSimilarity(a: AllCanvasNodeData, b: AllCanvasNodeData): number {
+  const ta = (a as unknown as { text?: string }).text ?? "", tb = (b as unknown as { text?: string }).text ?? "";
+  let s = 0;
+  const ya = extractYear(ta), yb = extractYear(tb);
+  if (ya !== null && yb !== null) {
+    const d = Math.abs(ya - yb);
+    if (d === 0) s += 0.45;
+    else if (d <= 3) s += 0.32;
+    else if (d <= 7) s += 0.18;
+    else if (d <= 15) s += 0.07;
+  }
+  const pa = extractPlace(ta), pb = extractPlace(tb);
+  if (pa && pb && pa === pb) s += 0.38;
+  // keyword overlap (simple Jaccard on words >3 chars)
+  const wa = new Set(ta.toLowerCase().split(/\W+/).filter((w) => w.length > 3));
+  const wb = new Set(tb.toLowerCase().split(/\W+/).filter((w) => w.length > 3));
+  let inter = 0;
+  for (const w of wa) if (wb.has(w)) inter++;
+  const uni = wa.size + wb.size - inter;
+  if (uni > 0) s += (inter / uni) * 0.25;
+  return Math.min(1, s);
+}
+
 // ── Edge side optimization (port of felixchenier/obsidian-optimize-canvas-connections) ──
 export type EdgeSide = "top" | "bottom" | "left" | "right";
 export type OptimizeMode = "shortest" | "preserve-axes";
@@ -356,13 +389,33 @@ export function forceLayoutComponent(
       let dx = (a.x + a.width / 2) - (b.x + b.width / 2);
       let dy = (a.y + a.height / 2) - (b.y + b.height / 2);
       let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-      const force = (dist * dist) / k * 0.04; // Hooke, tuned small
+      const force = (dist * dist) / k * 0.04;
       const fx = (dx / dist) * force;
       const fy = (dy / dist) * force;
       a.vx -= fx;
       a.vy -= fy;
       b.vx += fx;
       b.vy += fy;
+    }
+    // context-aware soft attraction for similar cards (year/place/text) — keeps related papers near each other even without explicit edge
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        if (edgePairs.some(([a, b]) => (a === i && b === j) || (a === j && b === i))) continue;
+        const sim = contextSimilarity(compNodes[i]!, compNodes[j]!);
+        if (sim < 0.19) continue;
+        const a = pos[i]!, b = pos[j]!;
+        let dx = (a.x + a.width / 2) - (b.x + b.width / 2);
+        let dy = (a.y + a.height / 2) - (b.y + b.height / 2);
+        let dist = Math.hypot(dx, dy) || 1;
+        if (dist > 900) continue;
+        const force = (dist * dist) / k * 0.032 * sim;
+        const fx = (dx / dist) * force;
+        const fy = (dy / dist) * force;
+        a.vx -= fx;
+        a.vy -= fy;
+        b.vx += fx;
+        b.vy += fy;
+      }
     }
     // gravity to center (keep compact)
     const cx = pos.reduce((s, p) => s + p.x + p.width / 2, 0) / n;

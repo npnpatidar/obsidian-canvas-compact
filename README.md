@@ -1,13 +1,13 @@
 # Canvas Compact for Obsidian
 
-Resize each canvas card to fit its content and pack all cards to take minimum space — **edge-aware**.
+Resize each canvas card to fit its content and pack all cards to take minimum space — **edge-aware + context-aware**.
 
-- **Fit to content** — height auto-fit via DOM `min-content` measurement (like `advanced-canvas`) + heuristic fallback for closed canvases. Snap to 20px grid.
+- **Fit to content** — height auto-fit via DOM `min-content` measurement (like `advanced-canvas`) + heuristic fallback. Snap to 20px grid.
 - **Pack layout** — three strategies:
-  - **MaxRects (BSSF)** — densest packing, 85-92% occupancy, saves ~42% area on isolated cards (26 cards: 2580×600 → 1060×840).
-  - **Masonry** — preserves reading order, shortest-column.
-  - **Graph (edge-aware)** — clusters by connections (connected components), force-directed layout per cluster to minimize edge length & keep neighbors close, then packs clusters via MaxRects. Also optimizes edge anchor sides.
-- **Optimize connections** — re-attaches edges to nearest sides (port of `felixchenier/obsidian-optimize-canvas-connections` with `shortest` and `preserve-axes` modes). Ensures all connections are short and visible after packing.
+  - **MaxRects (BSSF)** — densest, 85-92% occupancy.
+  - **Masonry** — preserves order.
+  - **Graph (edge-aware + context-aware)** — clusters by explicit edges, **force-directed per cluster with context similarity (year/place/text) attraction**, layered for DAGs, then `MaxRects` packs clusters. Edge side optimization penalizes hidden edges and edge-node repulsion ensures visibility.
+- **Optimize connections** — re-attaches to nearest sides, now **visibility-aware** (chooses sides with minimal intersections).
 
 ## Commands
 
@@ -39,7 +39,7 @@ Copy `main.js` + `manifest.json` to `<vault>/.obsidian/plugins/canvas-compact/`.
 mkPlugin {
   id = "canvas-compact";
   repo = "npnpatidar/obsidian-canvas-compact";
-  version = "1.1.0";
+  version = "1.2.0";
   mainJsHash = "...";
   manifestHash = "...";
 }
