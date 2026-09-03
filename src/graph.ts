@@ -17,10 +17,40 @@ function pointForSide(node: AllCanvasNodeData, side: EdgeSide): { x: number; y: 
 
 function sideOptions(current: string | undefined, mode: OptimizeMode): EdgeSide[] {
   if (mode === "shortest") return ["top", "bottom", "left", "right"];
-  // preserve-axes: keep vertical vs horizontal axis
   if (current === "top" || current === "bottom") return ["top", "bottom"];
   if (current === "left" || current === "right") return ["left", "right"];
   return ["top", "bottom", "left", "right"];
+}
+
+function segmentIntersectsRect(
+  x1: number, y1: number, x2: number, y2: number,
+  rx: number, ry: number, rw: number, rh: number
+): boolean {
+  const minX = Math.min(x1, x2), maxX = Math.max(x1, x2);
+  const minY = Math.min(y1, y2), maxY = Math.max(y1, y2);
+  if (maxX < rx || minX > rx + rw || maxY < ry || minY > ry + rh) return false;
+  // sample along segment to check interior hits; also check if either endpoint inside rect
+  if (x1 >= rx && x1 <= rx + rw && y1 >= ry && y1 <= ry + rh) return true;
+  if (x2 >= rx && x2 <= rx + rw && y2 >= ry && y2 <= ry + rh) return true;
+  // check if segment crosses rect edges using line-rect intersection (coarse: check 5 sample points)
+  for (let t = 0.15; t < 1; t += 0.2) {
+    const x = x1 + (x2 - x1) * t;
+    const y = y1 + (y2 - y1) * t;
+    if (x >= rx && x <= rx + rw && y >= ry && y <= ry + rh) return true;
+  }
+  return false;
+}
+
+function countIntersections(
+  fromPt: { x: number; y: number }, toPt: { x: number; y: number },
+  nodes: AllCanvasNodeData[], excludeIds: Set<string>
+): number {
+  let c = 0;
+  for (const n of nodes) {
+    if (excludeIds.has(n.id)) continue;
+    if (segmentIntersectsRect(fromPt.x, fromPt.y, toPt.x, toPt.y, n.x, n.y, n.width, n.height)) c++;
+  }
+  return c;
 }
 
 /**
@@ -53,13 +83,17 @@ export function optimizeEdges(
     const fOpts = fromOpts.length ? fromOpts : (["top","bottom","left","right"] as EdgeSide[]);
     const tOpts = toOpts.length ? toOpts : (["top","bottom","left","right"] as EdgeSide[]);
 
-    let best: { fromSide: EdgeSide; toSide: EdgeSide; dist: number } | null = null;
+    let best: { fromSide: EdgeSide; toSide: EdgeSide; dist: number; hits: number } | null = null;
+    const exclude = new Set([fromNode.id, toNode.id]);
     for (const fs of fOpts) {
       const fp = pointForSide(fromNode, fs);
       for (const ts of tOpts) {
         const tp = pointForSide(toNode, ts);
         const d = (tp.x - fp.x) ** 2 + (tp.y - fp.y) ** 2;
-        if (!best || d < best.dist) best = { fromSide: fs, toSide: ts, dist: d };
+        const hits = countIntersections(fp, tp, nodes, exclude);
+        if (!best || hits < best.hits || (hits === best.hits && d < best.dist)) {
+          best = { fromSide: fs, toSide: ts, dist: d, hits };
+        }
       }
     }
     if (!best) return edge;
@@ -339,6 +373,33 @@ export function forceLayoutComponent(
       p.vx -= dx * 0.01 * temp;
       p.vy -= dy * 0.01 * temp;
     }
+    // edge visibility: push nodes away from edges they would hide
+    for (const [ai, bi] of edgePairs) {
+      const a = pos[ai]!, b = pos[bi]!;
+      const ax = a.x + a.width / 2, ay = a.y + a.height / 2;
+      const bx = b.x + b.width / 2, by = b.y + b.height / 2;
+      for (let ni = 0; ni < n; ni++) {
+        if (ni === ai || ni === bi) continue;
+        const p = pos[ni]!;
+        if (segmentIntersectsRect(ax, ay, bx, by, p.x - gap / 2, p.y - gap / 2, p.width + gap, p.height + gap)) {
+          const ex = bx - ax, ey = by - ay;
+          const len = Math.hypot(ex, ey) || 1;
+          const nx = -ey / len, ny = ex / len;
+          const px = p.x + p.width / 2, py = p.y + p.height / 2;
+          const mx = (ax + bx) / 2, my = (ay + by) / 2;
+          const dot = (px - mx) * nx + (py - my) * ny;
+          const dir = dot >= 0 ? 1 : -1;
+          const push = 16 * (1 - iter / iterations * 0.5);
+          p.vx += nx * dir * push;
+          p.vy += ny * dir * push;
+          // also slightly push endpoints apart to reduce overlap
+          a.vx -= nx * dir * 2;
+          a.vy -= ny * dir * 2;
+          b.vx += nx * dir * 2;
+          b.vy += ny * dir * 2;
+        }
+      }
+    }
 
     // integrate
     for (const p of pos) {
@@ -396,12 +457,12 @@ export function graphPack(
   }
   const gap = opts.gap;
   const padding = opts.padding;
+  const visibilityGap = gap + 14;
   const comps = connectedComponents(nodes, edges);
-  // For each component, force-layout internally
   const laidComps: AllCanvasNodeData[][] = [];
   for (const comp of comps) {
     const compEdgeSet = edges.filter((e) => comp.some((n) => n.id === e.fromNode) && comp.some((n) => n.id === e.toNode));
-    const laid = forceLayoutComponent(comp, compEdgeSet, gap, opts.iterations ?? 250);
+    const laid = forceLayoutComponent(comp, compEdgeSet, visibilityGap, opts.iterations ?? 280);
     // normalize each comp's bbox to start at 0,0 for clean packing (already normalized)
     // shift to have min 0,0 within component (already)
     laidComps.push(laid);
@@ -437,7 +498,45 @@ export function graphPack(
   }
 
   // Finally optimize edge sides for new positions
-  const optimizedEdges = optimizeEdges(outNodes, edges, opts.optimizeMode ?? "shortest");
+  let finalNodes = outNodes;
+  let finalEdges = optimizeEdges(finalNodes, edges, opts.optimizeMode ?? "shortest");
 
-  return { nodes: outNodes, edges: optimizedEdges };
+  // Ensure complete edge visibility: if any edge segment still intersects a card, nudge the blocker
+  for (let iter = 0; iter < 8; iter++) {
+    let hidden: { edge: CanvasEdgeData; nodeId: string } | null = null;
+    outer: for (const e of finalEdges) {
+      const fromN = finalNodes.find((n) => n.id === e.fromNode);
+      const toN = finalNodes.find((n) => n.id === e.toNode);
+      if (!fromN || !toN) continue;
+      const fromPt = pointForSide(fromN, (e.fromSide as EdgeSide) ?? "right");
+      const toPt = pointForSide(toN, (e.toSide as EdgeSide) ?? "left");
+      for (const n of finalNodes) {
+        if (n.id === e.fromNode || n.id === e.toNode) continue;
+        if (segmentIntersectsRect(fromPt.x, fromPt.y, toPt.x, toPt.y, n.x, n.y, n.width, n.height)) {
+          hidden = { edge: e, nodeId: n.id };
+          break outer;
+        }
+      }
+    }
+    if (!hidden) break;
+    const idx = finalNodes.findIndex((n) => n.id === hidden.nodeId);
+    if (idx === -1) break;
+    const node = finalNodes[idx]!;
+    const edge = hidden.edge;
+    const fromN = finalNodes.find((n) => n.id === edge.fromNode)!;
+    const toN = finalNodes.find((n) => n.id === edge.toNode)!;
+    const fromPt = pointForSide(fromN, (edge.fromSide as EdgeSide) ?? "right");
+    const toPt = pointForSide(toN, (edge.toSide as EdgeSide) ?? "left");
+    const ex = toPt.x - fromPt.x, ey = toPt.y - fromPt.y;
+    const len = Math.hypot(ex, ey) || 1;
+    const nx = -ey / len, ny = ex / len;
+    const px = node.x + node.width / 2, py = node.y + node.height / 2;
+    const mx = (fromPt.x + toPt.x) / 2, my = (fromPt.y + toPt.y) / 2;
+    const dot = (px - mx) * nx + (py - my) * ny;
+    const dir = dot >= 0 ? 1 : -1;
+    finalNodes = finalNodes.map((n, i) => (i === idx ? { ...n, x: n.x + nx * dir * 42, y: n.y + ny * dir * 42 } as AllCanvasNodeData : n));
+    finalEdges = optimizeEdges(finalNodes, finalEdges, opts.optimizeMode ?? "shortest");
+  }
+
+  return { nodes: finalNodes, edges: finalEdges };
 }
