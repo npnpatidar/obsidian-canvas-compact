@@ -1,0 +1,21 @@
+{
+  "name": "canvas-compact",
+  "version": "1.0.0",
+  "description": "Obsidian plugin: resize canvas cards to fit content and pack layout to minimum area",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "version": "node version-bump.mjs && git add manifest.json versions.json"
+  },
+  "keywords": ["obsidian", "canvas", "layout", "packing"],
+  "author": "Sisyphus",
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "0.25.5",
+    "obsidian": "latest",
+    "typescript": "^5.8.3",
+    "@types/node": "^20.0.0"
+  }
+}
