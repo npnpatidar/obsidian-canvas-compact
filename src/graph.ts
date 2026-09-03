@@ -62,15 +62,19 @@ function segmentIntersectsRect(
   const minX = Math.min(x1, x2), maxX = Math.max(x1, x2);
   const minY = Math.min(y1, y2), maxY = Math.max(y1, y2);
   if (maxX < rx || minX > rx + rw || maxY < ry || minY > ry + rh) return false;
-  // sample along segment to check interior hits; also check if either endpoint inside rect
   if (x1 >= rx && x1 <= rx + rw && y1 >= ry && y1 <= ry + rh) return true;
   if (x2 >= rx && x2 <= rx + rw && y2 >= ry && y2 <= ry + rh) return true;
-  // check if segment crosses rect edges using line-rect intersection (coarse: check 5 sample points)
-  for (let t = 0.15; t < 1; t += 0.2) {
-    const x = x1 + (x2 - x1) * t;
-    const y = y1 + (y2 - y1) * t;
-    if (x >= rx && x <= rx + rw && y >= ry && y <= ry + rh) return true;
+  function ccw(ax: number, ay: number, bx: number, by: number, cx: number, cy: number): boolean {
+    return (cy - ay) * (bx - ax) > (by - ay) * (cx - ax);
   }
+  function segI(ax: number, ay: number, bx: number, by: number, cx: number, cy: number, dx: number, dy: number): boolean {
+    return ccw(ax, ay, cx, cy, dx, dy) !== ccw(bx, by, cx, cy, dx, dy) && ccw(ax, ay, bx, by, cx, cy) !== ccw(ax, ay, bx, by, dx, dy);
+  }
+  const rx2 = rx + rw, ry2 = ry + rh;
+  if (segI(x1, y1, x2, y2, rx, ry, rx2, ry)) return true;
+  if (segI(x1, y1, x2, y2, rx2, ry, rx2, ry2)) return true;
+  if (segI(x1, y1, x2, y2, rx2, ry2, rx, ry2)) return true;
+  if (segI(x1, y1, x2, y2, rx, ry2, rx, ry)) return true;
   return false;
 }
 
@@ -116,16 +120,32 @@ export function optimizeEdges(
     const fOpts = fromOpts.length ? fromOpts : (["top","bottom","left","right"] as EdgeSide[]);
     const tOpts = toOpts.length ? toOpts : (["top","bottom","left","right"] as EdgeSide[]);
 
-    let best: { fromSide: EdgeSide; toSide: EdgeSide; dist: number; hits: number } | null = null;
+    let best: { fromSide: EdgeSide; toSide: EdgeSide; dist: number; hits: number; labelHits: number } | null = null;
     const exclude = new Set([fromNode.id, toNode.id]);
+    const label = (edge as unknown as { label?: string }).label ?? "";
     for (const fs of fOpts) {
       const fp = pointForSide(fromNode, fs);
       for (const ts of tOpts) {
         const tp = pointForSide(toNode, ts);
         const d = (tp.x - fp.x) ** 2 + (tp.y - fp.y) ** 2;
         const hits = countIntersections(fp, tp, nodes, exclude);
-        if (!best || hits < best.hits || (hits === best.hits && d < best.dist)) {
-          best = { fromSide: fs, toSide: ts, dist: d, hits };
+        let labelHits = 0;
+        if (label) {
+          const mx = (fp.x + tp.x) / 2, my = (fp.y + tp.y) / 2;
+          const lines = label.split("\n").length;
+          const w = Math.max(...label.split("\n").map((l) => l.length)) * 7 + 16;
+          const h = lines * 16 + 10;
+          const lbx = mx - w / 2, lby = my - h / 2;
+          for (const n of nodes) {
+            if (exclude.has(n.id)) continue;
+            if (!(lbx + w < n.x || n.x + n.width < lbx || lby + h < n.y || n.y + n.height < lby)) labelHits++;
+          }
+          // also require minimum edge length for label to fit (60px + label width)
+          const minLen = Math.max(70, w + 20);
+          if (Math.hypot(tp.x - fp.x, tp.y - fp.y) < minLen) labelHits++;
+        }
+        if (!best || labelHits < best.labelHits || (labelHits === best.labelHits && (hits < best.hits || (hits === best.hits && d < best.dist)))) {
+          best = { fromSide: fs, toSide: ts, dist: d, hits, labelHits };
         }
       }
     }
@@ -317,6 +337,18 @@ export function forceLayoutComponent(
   gap: number,
   iterations = 250
 ): AllCanvasNodeData[] {
+  // small complete graphs (e.g., relations 3 nodes triangle) — place in triangle/circle for label visibility
+  if (compNodes.length === 3 && compEdges.length === 3) {
+    const [a, b, c] = compNodes;
+    if (!a || !b || !c) return compNodes;
+    const maxW = Math.max(a.width, b.width, c.width);
+    const maxH = Math.max(a.height, b.height, c.height);
+    return [
+      { ...a, x: 0, y: 0 } as AllCanvasNodeData,
+      { ...b, x: maxW + gap + 40, y: 0 } as AllCanvasNodeData,
+      { ...c, x: (maxW + gap) / 2, y: maxH + gap + 60 } as AllCanvasNodeData,
+    ];
+  }
   // try layered first for DAGs (more compact & edge-friendly)
   const layered = layeredLayoutComponent(compNodes, compEdges, gap);
   if (layered) return layered;
