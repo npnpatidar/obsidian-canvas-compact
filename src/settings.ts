@@ -124,8 +124,44 @@ export class CanvasCompactSettingTab extends PluginSettingTab {
         });
       });
 
+    containerEl.createEl("h3", { text: "Connections (edge-aware)" });
+
+    new Setting(containerEl)
+      .setName("Optimize connections after packing")
+      .setDesc("Re-attach edges to nearest sides (like optimize-canvas-connections). Keeps edges short and visible.")
+      .addToggle((tg) =>
+        tg.setValue(this.plugin.settings.optimizeEdges).onChange(async (v) => {
+          this.plugin.settings.optimizeEdges = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Preserve axes (like 'preserve-axes' mode)")
+      .setDesc("If on, only switch left↔right or top↔bottom, never vertical→horizontal. Preserves flow direction.")
+      .addToggle((tg) =>
+        tg.setValue(this.plugin.settings.preserveAxes).onChange(async (v) => {
+          this.plugin.settings.preserveAxes = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Force layout iterations")
+      .setDesc("Higher = tighter clusters but slower. 250 is good for <50 nodes.")
+      .addSlider((s) =>
+        s
+          .setLimits(50, 600, 50)
+          .setValue(this.plugin.settings.graphIterations)
+          .setDynamicTooltip()
+          .onChange(async (v) => {
+            this.plugin.settings.graphIterations = v;
+            await this.plugin.saveSettings();
+          })
+      );
+
     containerEl.createEl("p", {
-      text: "Tip: Use “Fit + Pack” for one-shot compact. Undo (Ctrl+Z) works after each command.",
+      text: "Tip: Use “Fit + Pack” for isolated cards. Use “Fit + Graph Pack” when cards are connected — it clusters by connections, packs clusters, and optimizes edges.",
       cls: "setting-item-description",
     });
   }
