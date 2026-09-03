@@ -179,6 +179,10 @@ export default class CanvasCompactPlugin extends Plugin {
 
   private async runPack(canvas: Canvas, override?: Partial<PackOptions>): Promise<void> {
     const data = canvas.getData() as CanvasData;
+    // If edges exist, use edge-aware graphPack by default to ensure visibility while minimizing area
+    if (data.edges.length > 0 && this.settings.optimizeEdges) {
+      return this.runGraphPack(canvas);
+    }
     const beforeNodes = [...data.nodes];
     const beforeLen = totalEdgeLength(beforeNodes, data.edges);
     const opts: PackOptions = {
@@ -234,7 +238,11 @@ export default class CanvasCompactPlugin extends Plugin {
   }
 
   private async runFitAndPack(canvas: Canvas): Promise<void> {
+    // edge-aware by default: if edges exist, use graph pack to keep connections visible
     const data = canvas.getData() as CanvasData;
+    if (data.edges.length > 0 && this.settings.optimizeEdges) {
+      return this.runFitAndGraphPack(canvas);
+    }
     const beforeNodes = [...data.nodes];
     const domMap = buildDomMap(canvas);
     const fitOpts: FitOptions = {
@@ -299,6 +307,9 @@ export default class CanvasCompactPlugin extends Plugin {
     const raw = await this.app.vault.cachedRead(file);
     let data: CanvasData;
     try { data = JSON.parse(raw) as CanvasData; } catch { new Notice("Invalid canvas file"); return; }
+    if (data.edges.length > 0 && this.settings.optimizeEdges) {
+      return this.fitAndGraphPackFile(file);
+    }
     const beforeNodes = [...data.nodes];
     const fitOpts: FitOptions = {
       minHeight: this.settings.fitMinHeight, maxHeight: this.settings.fitMaxHeight,
