@@ -122,13 +122,23 @@ export default class CanvasCompactPlugin extends Plugin {
     });
     this.addCommand({
       id: "canvas-compact-tidy-change-dir",
-      name: "Tidy layout — allow changing connection directions",
-      checkCallback: this.withCanvas((canvas) => this.runTidy(canvas, false)),
+      name: "Tidy layout — allow changing directions (top → bottom)",
+      checkCallback: this.withCanvas((canvas) => this.runTidy(canvas, false, "top-to-bottom")),
     });
     this.addCommand({
       id: "canvas-compact-tidy-preserve-dir",
-      name: "Tidy layout — preserve existing connection directions",
-      checkCallback: this.withCanvas((canvas) => this.runTidy(canvas, true)),
+      name: "Tidy layout — preserve directions (top → bottom)",
+      checkCallback: this.withCanvas((canvas) => this.runTidy(canvas, true, "top-to-bottom")),
+    });
+    this.addCommand({
+      id: "canvas-compact-tidy-change-dir-lr",
+      name: "Tidy layout — allow changing directions (left → right)",
+      checkCallback: this.withCanvas((canvas) => this.runTidy(canvas, false, "left-to-right")),
+    });
+    this.addCommand({
+      id: "canvas-compact-tidy-preserve-dir-lr",
+      name: "Tidy layout — preserve directions (left → right)",
+      checkCallback: this.withCanvas((canvas) => this.runTidy(canvas, true, "left-to-right")),
     });
 
     this.registerEvent(
@@ -312,7 +322,7 @@ export default class CanvasCompactPlugin extends Plugin {
     new Notice(`Fit + Graph Pack: ${packed.length} cards, ${edges.length} edges — saved ${stats.savedPct}% area, edges ${beforeLen}→${afterLen}px`);
   }
 
-  private async runTidy(canvas: Canvas, preserveDirection: boolean): Promise<void> {
+  private async runTidy(canvas: Canvas, preserveDirection: boolean, direction: "top-to-bottom" | "left-to-right" = "top-to-bottom"): Promise<void> {
     const data = canvas.getData() as CanvasData;
     if (data.edges.length === 0) {
       new Notice("Tidy layout needs connections; this canvas has none.");
@@ -325,11 +335,13 @@ export default class CanvasCompactPlugin extends Plugin {
       iterations: this.settings.graphIterations,
     };
     const beforeLen = totalEdgeLength(data.nodes, data.edges);
-    const { nodes: tidied, edges } = tidyLayout([...data.nodes], [...data.edges], { ...gOpts, preserveDirection });
+    const { nodes: tidied, edges } = tidyLayout([...data.nodes], [...data.edges], { ...gOpts, preserveDirection, direction });
     const afterLen = totalEdgeLength(tidied, edges);
     canvas.setData({ ...data, nodes: tidied, edges });
     canvas.requestSave(false);
-    new Notice(`Tidy layout${preserveDirection ? " (preserve direction)" : " (allow direction change)"}: ${tidied.length} cards, ${edges.length} edges — total edge length ${beforeLen}→${afterLen}px`);
+    const dirLabel = direction === "left-to-right" ? " →" : " ↓";
+    const modeLabel = preserveDirection ? " (preserve direction)" : " (allow direction change)";
+    new Notice(`Tidy layout${modeLabel}${dirLabel}: ${tidied.length} cards, ${edges.length} edges — total edge length ${beforeLen}→${afterLen}px`);
   }
 
   // ── File (when canvas not open) ──

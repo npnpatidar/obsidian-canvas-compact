@@ -323,11 +323,13 @@ export function layeredLayoutComponent(
  * Cycle-tolerant layered layout: longest-path layering that tolerates cycles (ignores
  * back-edges), so it works for any graph topology. Connected nodes across ranks get
  * bottom→top edges, within-rank nodes get left→right edges — clean orthogonal connections.
+ * direction="top-to-bottom" stacks ranks downward; "left-to-right" stacks them rightward.
  */
 function layeredLayoutAny(
   compNodes: AllCanvasNodeData[],
   compEdges: CanvasEdgeData[],
-  gap: number
+  gap: number,
+  direction: "top-to-bottom" | "left-to-right" = "top-to-bottom"
 ): AllCanvasNodeData[] {
   const n = compNodes.length;
   if (n === 0) return compNodes;
@@ -401,26 +403,31 @@ function layeredLayoutAny(
     }
   }
 
-  let curY = 0;
+  const isLR = direction === "left-to-right";
+  let curMain = 0;
   const out = new Map<string, AllCanvasNodeData>();
-  let maxLayerWidth = 0;
+  let maxLayerSpan = 0;
   for (let l = 0; l <= maxLayer; l++) {
     const arr = layers.get(l) ?? [];
-    const w = arr.reduce((s, nd) => s + nd.width, 0) + Math.max(0, arr.length - 1) * gap;
-    maxLayerWidth = Math.max(maxLayerWidth, w);
+    const span = arr.reduce((s, nd) => s + (isLR ? nd.height : nd.width), 0) + Math.max(0, arr.length - 1) * gap;
+    maxLayerSpan = Math.max(maxLayerSpan, span);
   }
   for (let l = 0; l <= maxLayer; l++) {
     const arr = layers.get(l) ?? [];
-    const layerW = arr.reduce((s, nd) => s + nd.width, 0) + Math.max(0, arr.length - 1) * gap;
-    let curX = (maxLayerWidth - layerW) / 2;
-    let maxH = 0;
-    for (const nd of arr) maxH = Math.max(maxH, nd.height);
+    const layerSpan = arr.reduce((s, nd) => s + (isLR ? nd.height : nd.width), 0) + Math.max(0, arr.length - 1) * gap;
+    let curCross = (maxLayerSpan - layerSpan) / 2;
+    let maxCross = 0;
+    for (const nd of arr) maxCross = Math.max(maxCross, isLR ? nd.width : nd.height);
     for (const nd of arr) {
-      const yOff = (maxH - nd.height) / 2;
-      out.set(nd.id, { ...nd, x: curX, y: curY + yOff } as AllCanvasNodeData);
-      curX += nd.width + gap;
+      const mainOff = (maxCross - (isLR ? nd.width : nd.height)) / 2;
+      if (isLR) {
+        out.set(nd.id, { ...nd, x: curMain + mainOff, y: curCross } as AllCanvasNodeData);
+      } else {
+        out.set(nd.id, { ...nd, x: curCross, y: curMain + mainOff } as AllCanvasNodeData);
+      }
+      curCross += (isLR ? nd.height : nd.width) + gap;
     }
-    curY += maxH + gap + 30;
+    curMain += maxCross + gap + 30;
   }
   return compNodes.map((nd) => out.get(nd.id) ?? nd);
 }
@@ -797,14 +804,17 @@ export function graphPack(
 /**
  * Orthogonal layered layout for a component of any topology. Assigns layers via
  * cycle-tolerant longest path, orders nodes by barycenter to reduce crossings, then
- * allocates a horizontal "slot" per parent that is divided among its children so parent
- * and child centers align — producing straight bottom→top connections. Edges are returned
- * with sides chosen for clean orthogonal routing (direction change allowed).
+ * allocates a slot per parent that is divided among its children so parent and child
+ * centers align — producing straight cross-layer connections.
+ *
+ * direction="top-to-bottom": layers flow downward, edges bottom→top
+ * direction="left-to-right": layers flow rightward, edges right→left
  */
 function orthogonalLayeredLayout(
   compNodes: AllCanvasNodeData[],
   compEdges: CanvasEdgeData[],
-  gap: number
+  gap: number,
+  direction: "top-to-bottom" | "left-to-right" = "top-to-bottom"
 ): { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[] } {
   const n = compNodes.length;
   if (n === 0) return { nodes: compNodes, edges: compEdges };
@@ -850,67 +860,84 @@ function orthogonalLayeredLayout(
     ch.sort((a, b) => (orderIndex(layers, a) ?? 0) - (orderIndex(layers, b) ?? 0));
   }
 
-  const widthOf = new Map<string, number>();
-  function subtreeWidth(id: string): number {
-    if (widthOf.has(id)) return widthOf.get(id)!;
+  // Slot allocation: for TB direction, measure horizontal extent of subtrees; for LR, measure vertical.
+  const isLR = direction === "left-to-right";
+  const dimOf = new Map<string, number>();
+  function subtreeDim(id: string): number {
+    if (dimOf.has(id)) return dimOf.get(id)!;
     const ch = children.get(id) ?? [];
-    if (ch.length === 0) { widthOf.set(id, idToNode.get(id)!.width); return idToNode.get(id)!.width; }
-    const kidsW = ch.reduce((s, c) => s + subtreeWidth(c), 0) + (ch.length - 1) * gap;
-    const w = Math.max(idToNode.get(id)!.width, kidsW);
-    widthOf.set(id, w);
-    return w;
+    const nd = idToNode.get(id)!;
+    const selfDim = isLR ? nd.height : nd.width;
+    if (ch.length === 0) { dimOf.set(id, selfDim); return selfDim; }
+    const kidsDim = ch.reduce((s, c) => s + subtreeDim(c), 0) + (ch.length - 1) * gap;
+    const d = Math.max(selfDim, kidsDim);
+    dimOf.set(id, d);
+    return d;
   }
-  for (const nd of compNodes) subtreeWidth(nd.id);
+  for (const nd of compNodes) subtreeDim(nd.id);
 
-  const placedLeft = new Map<string, number>();
-  let gx = 0;
-  function assign(id: string, left: number): number {
-    if (placedLeft.has(id)) return left;
-    placedLeft.set(id, left);
+  const placed = new Map<string, number>();
+  let gc = 0;
+  function assign(id: string, pos: number): number {
+    if (placed.has(id)) return pos;
+    placed.set(id, pos);
     const node = idToNode.get(id)!;
     const ch = children.get(id) ?? [];
-    if (ch.length === 0) return left + node.width + gap;
-    const kidsWidth = ch.reduce((s, c) => s + widthOf.get(c)!, 0) + (ch.length - 1) * gap;
-    const center = left + node.width / 2;
-    let cur = center - kidsWidth / 2;
+    const selfDim = isLR ? node.height : node.width;
+    if (ch.length === 0) return pos + selfDim + gap;
+    const kidsDim = ch.reduce((s, c) => s + dimOf.get(c)!, 0) + (ch.length - 1) * gap;
+    const center = pos + selfDim / 2;
+    let cur = center - kidsDim / 2;
     for (const kid of ch) {
-      assign(kid, cur + (widthOf.get(kid)! - idToNode.get(kid)!.width) / 2);
-      cur += widthOf.get(kid)! + gap;
+      const kidNode = idToNode.get(kid)!;
+      const kidSelfDim = isLR ? kidNode.height : kidNode.width;
+      assign(kid, cur + (dimOf.get(kid)! - kidSelfDim) / 2);
+      cur += dimOf.get(kid)! + gap;
     }
-    return Math.max(left + node.width, cur);
+    return Math.max(pos + selfDim, cur);
   }
   for (const root of (layers.get(0) ?? []).map((nd) => nd.id)) {
-    gx = assign(root, gx);
+    gc = assign(root, gc);
   }
 
-  if (placedLeft.size < n) {
-    for (const nd of compNodes) if (!placedLeft.has(nd.id)) { placedLeft.set(nd.id, gx); gx += nd.width + gap; }
+  if (placed.size < n) {
+    for (const nd of compNodes) if (!placed.has(nd.id)) { placed.set(nd.id, gc); gc += (isLR ? nd.height : nd.width) + gap; }
   }
 
-  const globalMin = Math.min(...compNodes.map((nd) => placedLeft.get(nd.id) ?? 0));
+  const globalMin = Math.min(...compNodes.map((nd) => placed.get(nd.id) ?? 0));
 
   const out = new Map<string, AllCanvasNodeData>();
-  let curY = 0;
+  let layerCursor = 0;
   for (let l = 0; l <= maxLayer; l++) {
     const arr = layers.get(l) ?? [];
-    let maxH = 0;
-    for (const nd of arr) maxH = Math.max(maxH, nd.height);
+    let maxCross = 0;
+    for (const nd of arr) maxCross = Math.max(maxCross, isLR ? nd.width : nd.height);
     for (const nd of arr) {
-      const left = (placedLeft.get(nd.id) ?? 0) - globalMin;
-      const yOff = (maxH - nd.height) / 2;
-      out.set(nd.id, { ...nd, x: left, y: curY + yOff } as AllCanvasNodeData);
+      const pos = (placed.get(nd.id) ?? 0) - globalMin;
+      const crossOff = (maxCross - (isLR ? nd.width : nd.height)) / 2;
+      if (isLR) {
+        out.set(nd.id, { ...nd, x: layerCursor + crossOff, y: pos } as AllCanvasNodeData);
+      } else {
+        out.set(nd.id, { ...nd, x: pos, y: layerCursor + crossOff } as AllCanvasNodeData);
+      }
     }
-    curY += maxH + gap + 30;
+    const maxMain = Math.max(...arr.map((nd) => isLR ? nd.width : nd.height));
+    layerCursor += maxMain + gap + 30;
   }
   const laidNodes = compNodes.map((nd) => out.get(nd.id) ?? nd);
 
+  // Edge sides: TB uses bottom→top; LR uses right→left
+  const fromSideTB = "bottom" as const, toSideTB = "top" as const;
+  const fromSideLR = "right" as const, toSideLR = "left" as const;
+  const fromSideCrossTB = "right" as const, toSideCrossTB = "left" as const;
+  const fromSideCrossLR = "bottom" as const, toSideCrossLR = "top" as const;
   const resultEdges = compEdges.map((e) => {
     const la = layer.get(e.fromNode) ?? 0, lb = layer.get(e.toNode) ?? 0;
-    if (la < lb) return { ...e, fromSide: "bottom" as const, toSide: "top" as const };
-    if (la > lb) return { ...e, fromSide: "top" as const, toSide: "bottom" as const };
+    if (la < lb) return { ...e, fromSide: isLR ? fromSideLR : fromSideTB, toSide: isLR ? toSideLR : toSideTB } as CanvasEdgeData;
+    if (la > lb) return { ...e, fromSide: isLR ? toSideLR : fromSideTB, toSide: isLR ? fromSideLR : toSideTB } as CanvasEdgeData;
     const oa = orderIndex(layers, e.fromNode) ?? 0, ob = orderIndex(layers, e.toNode) ?? 0;
-    if (oa < ob) return { ...e, fromSide: "right" as const, toSide: "left" as const };
-    return { ...e, fromSide: "left" as const, toSide: "right" as const };
+    if (oa < ob) return { ...e, fromSide: isLR ? fromSideCrossLR : fromSideCrossTB, toSide: isLR ? toSideCrossLR : toSideCrossTB } as CanvasEdgeData;
+    return { ...e, fromSide: isLR ? toSideCrossLR : toSideCrossTB, toSide: isLR ? fromSideCrossLR : fromSideCrossTB } as CanvasEdgeData;
   });
   return { nodes: laidNodes, edges: resultEdges };
 }
@@ -928,12 +955,13 @@ function orderIndex(layers: Map<number, AllCanvasNodeData[]>, id: string): numbe
 export function tidyLayout(
   nodes: AllCanvasNodeData[],
   edges: CanvasEdgeData[],
-  opts: PackOptions & { preserveDirection?: boolean; gap?: number; iterations?: number; optimizeMode?: OptimizeMode }
+  opts: PackOptions & { preserveDirection?: boolean; gap?: number; iterations?: number; optimizeMode?: OptimizeMode; direction?: "top-to-bottom" | "left-to-right" }
 ): { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[] } {
   if (nodes.length === 0) return { nodes, edges };
   const gap = opts.gap ?? 40;
   const margin = opts.padding ?? 60;
   const preserve = opts.preserveDirection ?? false;
+  const direction = opts.direction ?? "top-to-bottom";
 
   const comps = connectedComponents(nodes, edges);
   const compEdgeList: CanvasEdgeData[][] = comps.map((comp) => {
@@ -945,12 +973,12 @@ export function tidyLayout(
   const laid: AllCanvasNodeData[][] = comps.map((comp, i) => {
     if (comp.length <= 0) return comp;
     if (!preserve) {
-      const r = orthogonalLayeredLayout(comp, compEdgeList[i]!, gap);
+      const r = orthogonalLayeredLayout(comp, compEdgeList[i]!, gap, direction);
       perCompEdges[i] = r.edges;
       return r.nodes;
     }
     perCompEdges[i] = compEdgeList[i]!;
-    return layeredLayoutAny(comp, compEdgeList[i]!, gap);
+    return layeredLayoutAny(comp, compEdgeList[i]!, gap, direction);
   });
 
   // Arrange component blocks in a clean flow: place each block after the previous,

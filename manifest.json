@@ -1,7 +1,7 @@
 {
   "id": "canvas-compact",
   "name": "Canvas Compact",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "minAppVersion": "1.4.0",
   "description": "Resize cards to fit content and pack to minimum area — straight-line, edge-aware, context-aware.",
   "author": "Sisyphus",
