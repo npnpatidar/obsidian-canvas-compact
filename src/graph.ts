@@ -250,7 +250,7 @@ function resolveCollisions(nodes: PosNode[], gap: number): void {
  * Layered (Sugiyama-style) layout for DAG components — compact, respects flow.
  * Returns null if graph has cycles (fallback to force).
  */
-function layeredLayoutComponent(
+export function layeredLayoutComponent(
   compNodes: AllCanvasNodeData[],
   compEdges: CanvasEdgeData[],
   gap: number
@@ -262,17 +262,14 @@ function layeredLayoutComponent(
   for (const nd of compNodes) { adj.set(nd.id, []); indeg.set(nd.id, 0); }
   for (const e of compEdges) {
     if (!idToNode.has(e.fromNode) || !idToNode.has(e.toNode)) continue;
-    // ignore self-loops
     if (e.fromNode === e.toNode) continue;
     adj.get(e.fromNode)!.push(e.toNode);
     indeg.set(e.toNode, (indeg.get(e.toNode) ?? 0) + 1);
   }
-  // Kahn + longest path layering
   const q: string[] = [];
   const layer = new Map<string, number>();
   for (const [id, d] of indeg) if (d === 0) { q.push(id); layer.set(id, 0); }
   let processed = 0;
-  // we need to propagate max layer
   const queue = [...q];
   while (queue.length) {
     const cur = queue.shift()!;
@@ -288,7 +285,6 @@ function layeredLayoutComponent(
   }
   if (processed !== n) return null; // cycle detected
 
-  // group by layer
   const layers = new Map<number, AllCanvasNodeData[]>();
   let maxLayer = 0;
   for (const nd of compNodes) {
@@ -297,13 +293,10 @@ function layeredLayoutComponent(
     if (!layers.has(l)) layers.set(l, []);
     layers.get(l)!.push(nd);
   }
-  // sort within layer by original x to preserve reading order, then width descending for stability
   for (const [, arr] of layers) arr.sort((a, b) => a.x - b.x || b.width - a.width);
 
-  // assign positions: y stacked, x left-to-right with gap, centered per layer
   let curY = 0;
   const out = new Map<string, AllCanvasNodeData>();
-  // compute max layer width to center layers
   let maxLayerWidth = 0;
   for (let l = 0; l <= maxLayer; l++) {
     const arr = layers.get(l) ?? [];
@@ -313,16 +306,121 @@ function layeredLayoutComponent(
   for (let l = 0; l <= maxLayer; l++) {
     const arr = layers.get(l) ?? [];
     const layerW = arr.reduce((s, nd) => s + nd.width, 0) + Math.max(0, arr.length - 1) * gap;
-    let curX = (maxLayerWidth - layerW) / 2; // center
+    let curX = (maxLayerWidth - layerW) / 2;
     let maxH = 0;
     for (const nd of arr) maxH = Math.max(maxH, nd.height);
     for (const nd of arr) {
-      // vertically center within layer row
       const yOff = (maxH - nd.height) / 2;
       out.set(nd.id, { ...nd, x: curX, y: curY + yOff } as AllCanvasNodeData);
       curX += nd.width + gap;
     }
-    curY += maxH + gap + 30; // 30 extra between layers for edge visibility
+    curY += maxH + gap + 30;
+  }
+  return compNodes.map((nd) => out.get(nd.id) ?? nd);
+}
+
+/**
+ * Cycle-tolerant layered layout: longest-path layering that tolerates cycles (ignores
+ * back-edges), so it works for any graph topology. Connected nodes across ranks get
+ * bottom→top edges, within-rank nodes get left→right edges — clean orthogonal connections.
+ */
+function layeredLayoutAny(
+  compNodes: AllCanvasNodeData[],
+  compEdges: CanvasEdgeData[],
+  gap: number
+): AllCanvasNodeData[] {
+  const n = compNodes.length;
+  if (n === 0) return compNodes;
+  const idToNode = new Map(compNodes.map((v) => [v.id, v]));
+  const adj = new Map<string, string[]>();
+  for (const nd of compNodes) adj.set(nd.id, []);
+  for (const e of compEdges) {
+    if (!idToNode.has(e.fromNode) || !idToNode.has(e.toNode)) continue;
+    if (e.fromNode === e.toNode) continue;
+    adj.get(e.fromNode)!.push(e.toNode);
+  }
+  const layer = new Map<string, number>();
+  for (const nd of compNodes) layer.set(nd.id, 0);
+  for (let pass = 0; pass < n; pass++) {
+    let changed = false;
+    for (const nd of compNodes) {
+      for (const nb of adj.get(nd.id) ?? []) {
+        const target = (layer.get(nd.id) ?? 0) + 1;
+        if ((layer.get(nb) ?? 0) < target) {
+          layer.set(nb, target);
+          changed = true;
+        }
+      }
+    }
+    if (!changed) break;
+  }
+
+  const layers = new Map<number, AllCanvasNodeData[]>();
+  let maxLayer = 0;
+  for (const nd of compNodes) {
+    const l = layer.get(nd.id) ?? 0;
+    maxLayer = Math.max(maxLayer, l);
+    if (!layers.has(l)) layers.set(l, []);
+    layers.get(l)!.push(nd);
+  }
+  for (const [, arr] of layers) arr.sort((a, b) => a.x - b.x || b.width - a.width);
+
+  const orderUp = new Map<string, number>();
+  for (let l = 0; l <= maxLayer; l++) (layers.get(l) ?? []).forEach((nd, i) => orderUp.set(nd.id, i));
+  for (let sweep = 0; sweep < maxLayer; sweep++) {
+    for (let l = 1; l <= maxLayer; l++) {
+      const arr = layers.get(l) ?? [];
+      const scored = arr.map((nd) => {
+        const ups: number[] = [];
+        for (const o of compNodes) if ((adj.get(o.id) ?? []).includes(nd.id) && (layer.get(o.id) ?? 0) === l - 1) ups.push(orderUp.get(o.id) ?? 0);
+        for (const nn of adj.get(nd.id) ?? []) if ((layer.get(nn) ?? 0) === l - 1) ups.push(orderUp.get(nn) ?? 0);
+        const bary = ups.length ? ups.reduce((s, x) => s + x, 0) / ups.length : (orderUp.get(nd.id) ?? 0);
+        return { nd, bary };
+      });
+      scored.sort((a, b) => a.bary - b.bary || (orderUp.get(a.nd.id) ?? 0) - (orderUp.get(b.nd.id) ?? 0));
+      layers.set(l, scored.map((s) => s.nd));
+      scored.forEach((s, i) => orderUp.set(s.nd.id, i));
+    }
+  }
+
+  const nbrDown = new Map<string, number>();
+  for (let l = 0; l <= maxLayer; l++) (layers.get(l) ?? []).forEach((nd, i) => nbrDown.set(nd.id, i));
+  for (let sweep = 0; sweep < maxLayer; sweep++) {
+    for (let l = maxLayer - 1; l >= 0; l--) {
+      const arr = layers.get(l) ?? [];
+      const scored = arr.map((nd) => {
+        const ups: number[] = [];
+        for (const nn of adj.get(nd.id) ?? []) if ((layer.get(nn) ?? 0) === l + 1) ups.push(nbrDown.get(nn) ?? 0);
+        for (const o of compNodes) if ((adj.get(o.id) ?? []).includes(nd.id) && (layer.get(o.id) ?? 0) === l + 1) ups.push(nbrDown.get(o.id) ?? 0);
+        const bary = ups.length ? ups.reduce((s, x) => s + x, 0) / ups.length : (nbrDown.get(nd.id) ?? 0);
+        return { nd, bary };
+      });
+      scored.sort((a, b) => a.bary - b.bary || (nbrDown.get(a.nd.id) ?? 0) - (nbrDown.get(b.nd.id) ?? 0));
+      layers.set(l, scored.map((s) => s.nd));
+      scored.forEach((s, i) => nbrDown.set(s.nd.id, i));
+    }
+  }
+
+  let curY = 0;
+  const out = new Map<string, AllCanvasNodeData>();
+  let maxLayerWidth = 0;
+  for (let l = 0; l <= maxLayer; l++) {
+    const arr = layers.get(l) ?? [];
+    const w = arr.reduce((s, nd) => s + nd.width, 0) + Math.max(0, arr.length - 1) * gap;
+    maxLayerWidth = Math.max(maxLayerWidth, w);
+  }
+  for (let l = 0; l <= maxLayer; l++) {
+    const arr = layers.get(l) ?? [];
+    const layerW = arr.reduce((s, nd) => s + nd.width, 0) + Math.max(0, arr.length - 1) * gap;
+    let curX = (maxLayerWidth - layerW) / 2;
+    let maxH = 0;
+    for (const nd of arr) maxH = Math.max(maxH, nd.height);
+    for (const nd of arr) {
+      const yOff = (maxH - nd.height) / 2;
+      out.set(nd.id, { ...nd, x: curX, y: curY + yOff } as AllCanvasNodeData);
+      curX += nd.width + gap;
+    }
+    curY += maxH + gap + 30;
   }
   return compNodes.map((nd) => out.get(nd.id) ?? nd);
 }
@@ -693,5 +791,270 @@ export function graphPack(
     if (!made) break;
   }
 
+  return { nodes: finalNodes, edges: finalEdges };
+}
+
+/**
+ * Orthogonal layered layout for a component of any topology. Assigns layers via
+ * cycle-tolerant longest path, orders nodes by barycenter to reduce crossings, then
+ * allocates a horizontal "slot" per parent that is divided among its children so parent
+ * and child centers align — producing straight bottom→top connections. Edges are returned
+ * with sides chosen for clean orthogonal routing (direction change allowed).
+ */
+function orthogonalLayeredLayout(
+  compNodes: AllCanvasNodeData[],
+  compEdges: CanvasEdgeData[],
+  gap: number
+): { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[] } {
+  const n = compNodes.length;
+  if (n === 0) return { nodes: compNodes, edges: compEdges };
+  const idToNode = new Map(compNodes.map((v) => [v.id, v]));
+  const adj = new Map<string, string[]>();
+  for (const nd of compNodes) adj.set(nd.id, []);
+  for (const e of compEdges) {
+    if (!idToNode.has(e.fromNode) || !idToNode.has(e.toNode) || e.fromNode === e.toNode) continue;
+    adj.get(e.fromNode)!.push(e.toNode);
+  }
+  const layer = new Map<string, number>();
+  for (const nd of compNodes) layer.set(nd.id, 0);
+  for (let pass = 0; pass < n; pass++) {
+    let changed = false;
+    for (const nd of compNodes) for (const nb of adj.get(nd.id) ?? []) {
+      if ((layer.get(nb) ?? 0) < (layer.get(nd.id) ?? 0) + 1) { layer.set(nb, (layer.get(nd.id) ?? 0) + 1); changed = true; }
+    }
+    if (!changed) break;
+  }
+
+  const layers = new Map<number, AllCanvasNodeData[]>();
+  let maxLayer = 0;
+  for (const nd of compNodes) {
+    const l = layer.get(nd.id) ?? 0;
+    maxLayer = Math.max(maxLayer, l);
+    if (!layers.has(l)) layers.set(l, []);
+    layers.get(l)!.push(nd);
+  }
+  for (const [, arr] of layers) arr.sort((a, b) => a.x - b.x || b.width - a.width);
+
+  const children = new Map<string, string[]>();
+  for (const nd of compNodes) children.set(nd.id, []);
+  for (const e of compEdges) {
+    if ((layer.get(e.fromNode) ?? 0) < (layer.get(e.toNode) ?? 0)) children.get(e.fromNode)!.push(e.toNode);
+    else if ((layer.get(e.fromNode) ?? 0) > (layer.get(e.toNode) ?? 0)) children.get(e.toNode)!.push(e.fromNode);
+    else {
+      if ((orderIndex(layers, e.fromNode) ?? 0) < (orderIndex(layers, e.toNode) ?? 0)) children.get(e.fromNode)!.push(e.toNode);
+      else children.get(e.toNode)!.push(e.fromNode);
+    }
+  }
+  for (const [, arr] of layers) for (const nd of arr) {
+    const ch = children.get(nd.id)!;
+    ch.sort((a, b) => (orderIndex(layers, a) ?? 0) - (orderIndex(layers, b) ?? 0));
+  }
+
+  const widthOf = new Map<string, number>();
+  function subtreeWidth(id: string): number {
+    if (widthOf.has(id)) return widthOf.get(id)!;
+    const ch = children.get(id) ?? [];
+    if (ch.length === 0) { widthOf.set(id, idToNode.get(id)!.width); return idToNode.get(id)!.width; }
+    const kidsW = ch.reduce((s, c) => s + subtreeWidth(c), 0) + (ch.length - 1) * gap;
+    const w = Math.max(idToNode.get(id)!.width, kidsW);
+    widthOf.set(id, w);
+    return w;
+  }
+  for (const nd of compNodes) subtreeWidth(nd.id);
+
+  const placedLeft = new Map<string, number>();
+  let gx = 0;
+  function assign(id: string, left: number): number {
+    if (placedLeft.has(id)) return left;
+    placedLeft.set(id, left);
+    const node = idToNode.get(id)!;
+    const ch = children.get(id) ?? [];
+    if (ch.length === 0) return left + node.width + gap;
+    const kidsWidth = ch.reduce((s, c) => s + widthOf.get(c)!, 0) + (ch.length - 1) * gap;
+    const center = left + node.width / 2;
+    let cur = center - kidsWidth / 2;
+    for (const kid of ch) {
+      assign(kid, cur + (widthOf.get(kid)! - idToNode.get(kid)!.width) / 2);
+      cur += widthOf.get(kid)! + gap;
+    }
+    return Math.max(left + node.width, cur);
+  }
+  for (const root of (layers.get(0) ?? []).map((nd) => nd.id)) {
+    gx = assign(root, gx);
+  }
+
+  if (placedLeft.size < n) {
+    for (const nd of compNodes) if (!placedLeft.has(nd.id)) { placedLeft.set(nd.id, gx); gx += nd.width + gap; }
+  }
+
+  const globalMin = Math.min(...compNodes.map((nd) => placedLeft.get(nd.id) ?? 0));
+
+  const out = new Map<string, AllCanvasNodeData>();
+  let curY = 0;
+  for (let l = 0; l <= maxLayer; l++) {
+    const arr = layers.get(l) ?? [];
+    let maxH = 0;
+    for (const nd of arr) maxH = Math.max(maxH, nd.height);
+    for (const nd of arr) {
+      const left = (placedLeft.get(nd.id) ?? 0) - globalMin;
+      const yOff = (maxH - nd.height) / 2;
+      out.set(nd.id, { ...nd, x: left, y: curY + yOff } as AllCanvasNodeData);
+    }
+    curY += maxH + gap + 30;
+  }
+  const laidNodes = compNodes.map((nd) => out.get(nd.id) ?? nd);
+
+  const resultEdges = compEdges.map((e) => {
+    const la = layer.get(e.fromNode) ?? 0, lb = layer.get(e.toNode) ?? 0;
+    if (la < lb) return { ...e, fromSide: "bottom" as const, toSide: "top" as const };
+    if (la > lb) return { ...e, fromSide: "top" as const, toSide: "bottom" as const };
+    const oa = orderIndex(layers, e.fromNode) ?? 0, ob = orderIndex(layers, e.toNode) ?? 0;
+    if (oa < ob) return { ...e, fromSide: "right" as const, toSide: "left" as const };
+    return { ...e, fromSide: "left" as const, toSide: "right" as const };
+  });
+  return { nodes: laidNodes, edges: resultEdges };
+}
+
+function orderIndex(layers: Map<number, AllCanvasNodeData[]>, id: string): number | undefined {
+  for (const [, arr] of layers) for (let i = 0; i < arr.length; i++) if (arr[i]!.id === id) return i;
+  return undefined;
+}
+
+/**
+ * Tidy layout: arrange nodes and connections to look clean and organized (not minimum-area).
+ * Each connected component (any topology) is laid out internally, then components are placed
+ * as separate blocks with generous spacing so nothing overlaps and all labels stay visible.
+ */
+export function tidyLayout(
+  nodes: AllCanvasNodeData[],
+  edges: CanvasEdgeData[],
+  opts: PackOptions & { preserveDirection?: boolean; gap?: number; iterations?: number; optimizeMode?: OptimizeMode }
+): { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[] } {
+  if (nodes.length === 0) return { nodes, edges };
+  const gap = opts.gap ?? 40;
+  const margin = opts.padding ?? 60;
+  const preserve = opts.preserveDirection ?? false;
+
+  const comps = connectedComponents(nodes, edges);
+  const compEdgeList: CanvasEdgeData[][] = comps.map((comp) => {
+    const ids = new Set(comp.map((n) => n.id));
+    return edges.filter((e) => ids.has(e.fromNode) && ids.has(e.toNode));
+  });
+
+  const perCompEdges: CanvasEdgeData[][] = [];
+  const laid: AllCanvasNodeData[][] = comps.map((comp, i) => {
+    if (comp.length <= 0) return comp;
+    if (!preserve) {
+      const r = orthogonalLayeredLayout(comp, compEdgeList[i]!, gap);
+      perCompEdges[i] = r.edges;
+      return r.nodes;
+    }
+    perCompEdges[i] = compEdgeList[i]!;
+    return layeredLayoutAny(comp, compEdgeList[i]!, gap);
+  });
+
+  // Arrange component blocks in a clean flow: place each block after the previous,
+  // wrapping to a new row when too wide. Generous spacing, no tight packing.
+  const blocks = laid.map((comp) => ({
+    comp,
+    bb: bboxOfNodes(comp),
+  }));
+  let cursorX = 0, cursorY = 0, rowMaxH = 0;
+  const maxRowWidth = 1600;
+  const blockGap = 120;
+  const offsets: { dx: number; dy: number }[] = [];
+  for (const b of blocks) {
+    if (cursorX > 0 && cursorX + b.bb.width > maxRowWidth) {
+      cursorX = 0;
+      cursorY += rowMaxH + blockGap;
+      rowMaxH = 0;
+    }
+    offsets.push({ dx: margin + cursorX, dy: margin + cursorY });
+    cursorX += b.bb.width + blockGap;
+    rowMaxH = Math.max(rowMaxH, b.bb.height);
+  }
+
+  const outNodes: AllCanvasNodeData[] = [];
+  const outEdges: CanvasEdgeData[] = [];
+  for (let ci = 0; ci < laid.length; ci++) {
+    const off = offsets[ci] ?? { dx: margin, dy: margin };
+    for (const nd of laid[ci]!) outNodes.push({ ...nd, x: nd.x + off.dx, y: nd.y + off.dy } as AllCanvasNodeData);
+    const ids = new Set(laid[ci]!.map((n) => n.id));
+    for (const e of perCompEdges[ci] ?? []) {
+      if (!ids.has(e.fromNode) || !ids.has(e.toNode)) continue;
+      outEdges.push(e);
+    }
+  }
+  const laidIds = new Set(outNodes.map((n) => n.id));
+  for (const e of edges) if (!laidIds.has(e.fromNode) || !laidIds.has(e.toNode)) outEdges.push(e);
+
+  let finalEdges = outEdges;
+  if (preserve) {
+    finalEdges = optimizeEdges(outNodes, outEdges, opts.optimizeMode ?? "shortest");
+  }
+
+  return ensureVisibility(outNodes, finalEdges, opts.optimizeMode ?? "shortest", !preserve);
+}
+
+/**
+ * Ensure every edge (and its label, if any) is fully visible — no edge segment hidden behind
+ * a card and no label box overlapping a card. Nudges blocking cards out of the way.
+ */
+function ensureVisibility(
+  nodes: AllCanvasNodeData[],
+  edges: CanvasEdgeData[],
+  optimizeMode: OptimizeMode,
+  preserveSides = false
+): { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[] } {
+  let finalNodes = nodes;
+  let finalEdges = edges;
+  for (let iter = 0; iter < 10; iter++) {
+    let blocker: { edge: CanvasEdgeData; nodeId: string; labelOverlap: boolean } | null = null;
+    outer: for (const e of finalEdges) {
+      const fromN = finalNodes.find((n) => n.id === e.fromNode);
+      const toN = finalNodes.find((n) => n.id === e.toNode);
+      if (!fromN || !toN) continue;
+      const fromPt = pointForSide(fromN, (e.fromSide as EdgeSide) ?? "right");
+      const toPt = pointForSide(toN, (e.toSide as EdgeSide) ?? "left");
+      const label = (e as unknown as { label?: string }).label ?? "";
+      const mx = (fromPt.x + toPt.x) / 2, my = (fromPt.y + toPt.y) / 2;
+      const lines = label ? label.split("\n").length : 1;
+      const lw = label ? Math.max(...label.split("\n").map((l) => l.length)) * 7 + 16 : 0;
+      const lh = label ? lines * 16 + 10 : 0;
+      for (const n of finalNodes) {
+        if (n.id === e.fromNode || n.id === e.toNode) continue;
+        if (segmentIntersectsRect(fromPt.x, fromPt.y, toPt.x, toPt.y, n.x, n.y, n.width, n.height)) {
+          blocker = { edge: e, nodeId: n.id, labelOverlap: false };
+          break outer;
+        }
+        if (label) {
+          const lbx = mx - lw / 2, lby = my - lh / 2;
+          if (!(lbx + lw < n.x || n.x + n.width < lbx || lby + lh < n.y || n.y + n.height < lby)) {
+            blocker = { edge: e, nodeId: n.id, labelOverlap: true };
+            break outer;
+          }
+        }
+      }
+    }
+    if (!blocker) break;
+    const idx = finalNodes.findIndex((n) => n.id === blocker.nodeId);
+    if (idx === -1) break;
+    const node = finalNodes[idx]!;
+    const e = blocker.edge;
+    const fromN = finalNodes.find((n) => n.id === e.fromNode)!;
+    const toN = finalNodes.find((n) => n.id === e.toNode)!;
+    const fromPt = pointForSide(fromN, (e.fromSide as EdgeSide) ?? "right");
+    const toPt = pointForSide(toN, (e.toSide as EdgeSide) ?? "left");
+    const ex = toPt.x - fromPt.x, ey = toPt.y - fromPt.y;
+    const len = Math.hypot(ex, ey) || 1;
+    const nx = -ey / len, ny = ex / len;
+    const px = node.x + node.width / 2, py = node.y + node.height / 2;
+    const mx = (fromPt.x + toPt.x) / 2, my = (fromPt.y + toPt.y) / 2;
+    const dot = (px - mx) * nx + (py - my) * ny;
+    const dir = dot >= 0 ? 1 : -1;
+    const nudge = blocker.labelOverlap ? 26 : 42;
+    finalNodes = finalNodes.map((n, i) => (i === idx ? { ...n, x: n.x + nx * dir * nudge, y: n.y + ny * dir * nudge } as AllCanvasNodeData : n));
+    if (!preserveSides) finalEdges = optimizeEdges(finalNodes, finalEdges, optimizeMode);
+  }
   return { nodes: finalNodes, edges: finalEdges };
 }

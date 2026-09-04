@@ -2,7 +2,7 @@ import { Plugin, Notice, TFile, ItemView, Menu } from "obsidian";
 import type { CanvasData, CanvasView, Canvas } from "./Canvas.d";
 import { fitAllNodes } from "./fit";
 import { packLayout, packingStats, DEFAULT_PACK_OPTIONS } from "./pack";
-import { graphPack, optimizeEdges } from "./graph";
+import { graphPack, optimizeEdges, tidyLayout } from "./graph";
 import type { FitOptions } from "./fit";
 import type { PackOptions } from "./pack";
 import type { OptimizeMode } from "./graph";
@@ -119,6 +119,16 @@ export default class CanvasCompactPlugin extends Plugin {
       id: "canvas-compact-fit-and-graph-pack",
       name: "Fit + Graph Pack (edge-aware compact)",
       checkCallback: this.withCanvas((canvas) => this.runFitAndGraphPack(canvas)),
+    });
+    this.addCommand({
+      id: "canvas-compact-tidy-change-dir",
+      name: "Tidy layout — allow changing connection directions",
+      checkCallback: this.withCanvas((canvas) => this.runTidy(canvas, false)),
+    });
+    this.addCommand({
+      id: "canvas-compact-tidy-preserve-dir",
+      name: "Tidy layout — preserve existing connection directions",
+      checkCallback: this.withCanvas((canvas) => this.runTidy(canvas, true)),
     });
 
     this.registerEvent(
@@ -300,6 +310,26 @@ export default class CanvasCompactPlugin extends Plugin {
     canvas.setData({ ...data, nodes: packed, edges });
     canvas.requestSave(false);
     new Notice(`Fit + Graph Pack: ${packed.length} cards, ${edges.length} edges — saved ${stats.savedPct}% area, edges ${beforeLen}→${afterLen}px`);
+  }
+
+  private async runTidy(canvas: Canvas, preserveDirection: boolean): Promise<void> {
+    const data = canvas.getData() as CanvasData;
+    if (data.edges.length === 0) {
+      new Notice("Tidy layout needs connections; this canvas has none.");
+      return;
+    }
+    const gOpts: PackOptions & { optimizeMode?: OptimizeMode; iterations?: number } = {
+      ...DEFAULT_PACK_OPTIONS, gap: this.settings.packGap, padding: this.settings.packPadding,
+      strategy: "maxrects", sortBy: this.settings.packSortBy, columns: this.settings.packColumns,
+      optimizeMode: this.settings.preserveAxes ? "preserve-axes" : "shortest",
+      iterations: this.settings.graphIterations,
+    };
+    const beforeLen = totalEdgeLength(data.nodes, data.edges);
+    const { nodes: tidied, edges } = tidyLayout([...data.nodes], [...data.edges], { ...gOpts, preserveDirection });
+    const afterLen = totalEdgeLength(tidied, edges);
+    canvas.setData({ ...data, nodes: tidied, edges });
+    canvas.requestSave(false);
+    new Notice(`Tidy layout${preserveDirection ? " (preserve direction)" : " (allow direction change)"}: ${tidied.length} cards, ${edges.length} edges — total edge length ${beforeLen}→${afterLen}px`);
   }
 
   // ── File (when canvas not open) ──
