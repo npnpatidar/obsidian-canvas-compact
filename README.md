@@ -56,7 +56,7 @@ Copy `main.js` + `manifest.json` to `<vault>/.obsidian/plugins/canvas-compact/`.
 mkPlugin {
   id = "canvas-compact";
   repo = "npnpatidar/obsidian-canvas-compact";
-  version = "1.2.0";
+  version = "1.4.0";
   mainJsHash = "...";
   manifestHash = "...";
 }
