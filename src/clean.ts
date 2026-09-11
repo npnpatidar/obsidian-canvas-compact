@@ -889,6 +889,88 @@ function optimizeEdgeClearance(
   return result;
 }
 
+/**
+ * Push a card clear of an infinite line (the carrier of a connection), moving it
+ * perpendicular to the line (up/down for a horizontal edge, left/right for a
+ * vertical one) so that neither the card nor `extraHalf` on the far side of the
+ * line remain within `margin` of it. Returns true if the card moved.
+ */
+function nudgeCardFromLine(
+  card: AllCanvasNodeData,
+  a: Pt,
+  b: Pt,
+  extraHalf: number,
+  margin: number
+): boolean {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-6) return false;
+  const px = -dy / len;
+  const py = dx / len;
+  const cx = card.x + card.width / 2;
+  const cy = card.y + card.height / 2;
+  const projHalf = (Math.abs(card.width * px) + Math.abs(card.height * py)) / 2;
+  const curDist = (cx - a.x) * px + (cy - a.y) * py;
+  const need = projHalf + extraHalf + margin;
+  if (Math.abs(curDist) >= need) return false;
+  const sign = curDist >= 0 ? 1 : -1;
+  card.x += px * (need - Math.abs(curDist)) * sign;
+  card.y += py * (need - Math.abs(curDist)) * sign;
+  return true;
+}
+
+/**
+ * The primary lever for "no connection behind a card": move the third-party
+ * cards that a connection passes through up/down/left/right (perpendicular to
+ * the connection) until they clear both the connection itself and its label.
+ * Bounded and deterministic; card/card overlap is re-resolved by the caller.
+ */
+function clearByMovingCards(
+  nodes: AllCanvasNodeData[],
+  edges: CanvasEdgeData[],
+  opts: CleanOptions,
+  iterations = 12
+): AllCanvasNodeData[] {
+  const out = nodes.map((n) => ({ ...n })) as AllCanvasNodeData[];
+  const margin = Math.max(6, Math.round(opts.gap / 3));
+  for (let pass = 0; pass < iterations; pass++) {
+    const nodeMap = new Map(out.map((n) => [n.id, n]));
+    let moved = false;
+    for (const e of edges) {
+      const seg = edgeSegment(e, nodeMap);
+      if (!seg) continue;
+      // 1) clear the connection itself.
+      for (const n of out) {
+        if (n.type === "group" || n.id === e.fromNode || n.id === e.toNode) continue;
+        if (
+          !segmentIntersectsRect(seg.a.x, seg.a.y, seg.b.x, seg.b.y, n.x, n.y, n.width, n.height)
+        )
+          continue;
+        if (nudgeCardFromLine(n, seg.a, seg.b, 0, margin)) moved = true;
+      }
+      // 2) clear the connection label so it never sits behind a card either.
+      const label = labelText(e);
+      if (label) {
+        const box = labelBoxFromSegment(seg, label, 8);
+        const pdx = seg.b.x - seg.a.x;
+        const pdy = seg.b.y - seg.a.y;
+        const plen = Math.hypot(pdx, pdy) || 1;
+        const px = -pdy / plen;
+        const py = pdx / plen;
+        const boxProjHalf = (Math.abs(box.width * px) + Math.abs(box.height * py)) / 2;
+        for (const n of out) {
+          if (n.type === "group" || n.id === e.fromNode || n.id === e.toNode) continue;
+          if (!rectsOverlap(box, toRect(n))) continue;
+          if (nudgeCardFromLine(n, seg.a, seg.b, boxProjHalf, margin)) moved = true;
+        }
+      }
+    }
+    if (!moved) break;
+  }
+  return out;
+}
+
 function countCrossingsInvolving(
   segs: (Segment | null)[],
   idx: number,
@@ -1080,6 +1162,17 @@ export function cleanLayout(
   const edgesArray = inputEdges.map((e) => edgeById.get(e.id) ?? e);
   // Route connections around cards first, then give labels clear space.
   let finalEdges = optimizeEdgeClearance(placed, edgesArray);
+  finalEdges = placeLabelsGlobally(placed, finalEdges);
+  // Move cards up/down/left/right so no connection (or its label) is drawn
+  // behind a card — the lever that re-seating edge sides cannot reach.
+  placed = clearByMovingCards(placed, finalEdges, opts);
+  placed = resolveOverlaps(placed, opts.gap);
+  // Moving cards moved their faces, so re-seat sides and labels once more.
+  finalEdges = optimizeEdgeClearance(placed, edgesArray);
+  finalEdges = placeLabelsGlobally(placed, finalEdges);
+  placed = clearByMovingCards(placed, finalEdges, opts);
+  placed = resolveOverlaps(placed, opts.gap);
+  finalEdges = optimizeEdgeClearance(placed, edgesArray);
   finalEdges = placeLabelsGlobally(placed, finalEdges);
   // Group containers are re-wrapped around their members (they are not laid out).
   const withGroups = fitGroups([...placed, ...groups], members, opts.padding);

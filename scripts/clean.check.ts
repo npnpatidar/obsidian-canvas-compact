@@ -153,6 +153,17 @@ for (let i = 0; i < 6; i++) {
   starEdges.push(edge(`hub-s${i}`, "hub", `s${i}`, LONG));
 }
 
+/* ── scenario 6: spanning edge must cross its own row of cards ── */
+// n0..n3 stacked in a column with a bounding edge n0<->n3; n1/n2 sit in the
+// way and must be jogged up/down rather than have the edge drawn behind them.
+const spanNodes: AnyNode[] = [node("n0", 0, 0), node("n1", 0, 200), node("n2", 0, 400), node("n3", 0, 600)];
+const spanEdges: AnyEdge[] = [
+  edge("e01", "n0", "n1"),
+  edge("e12", "n1", "n2"),
+  edge("e23", "n2", "n3"),
+  edge("e30", "n3", "n0", "spanning"),
+];
+
 console.log("=== clean layout verification ===");
 run("Mind-map tree", tree, treeEdges, "top-to-bottom");
 run("Mind-map tree", tree, treeEdges, "balanced");
@@ -167,12 +178,20 @@ run(
 );
 run("Star, long labels", star, starEdges, "balanced");
 run("K5 (non-planar)", k5, k5Edges, "top-to-bottom", undefined, false);
+run("Spanning edge across cards", spanNodes, spanEdges, "top-to-bottom");
 
 const treeReport = cleanLayout(tree as never[], treeEdges as never[], {
   ...DEFAULT_CLEAN_OPTIONS,
   direction: "balanced",
 }).report;
 check(treeReport.edgeCrossings === 0, `tree crossings = ${treeReport.edgeCrossings} (expected 0)`);
+
+const spanResult = cleanLayout(spanNodes as never[], spanEdges as never[], {
+  ...DEFAULT_CLEAN_OPTIONS,
+  direction: "top-to-bottom",
+});
+check(spanResult.report.edgeCardHits === 0, `spanning edge behind cards = ${spanResult.report.edgeCardHits} (expected 0)`);
+check(spanResult.report.labelCardOverlaps === 0, `spanning label behind cards = ${spanResult.report.labelCardOverlaps} (expected 0)`);
 
 console.log(`\n=== ${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`} ===`);
 process.exit(failures === 0 ? 0 : 1);
