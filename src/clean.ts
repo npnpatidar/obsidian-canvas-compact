@@ -890,22 +890,22 @@ function optimizeEdgeClearance(
 }
 
 /**
- * Push a card clear of an infinite line (the carrier of a connection), moving it
- * perpendicular to the line (up/down for a horizontal edge, left/right for a
- * vertical one) so that neither the card nor `extraHalf` on the far side of the
- * line remain within `margin` of it. Returns true if the card moved.
+ * Clearance delta that fully separates a card from an edge's carrier line,
+ * moving perpendicular to the edge (up/down for a horizontal edge, left/right
+ * for a vertical one) so neither the card nor `extraHalf` beyond the line stays
+ * within `margin` of it. Returns null when already clear.
  */
-function nudgeCardFromLine(
+function perpClearDelta(
   card: AllCanvasNodeData,
   a: Pt,
   b: Pt,
   extraHalf: number,
   margin: number
-): boolean {
+): { dx: number; dy: number; mag: number } | null {
   const dx = b.x - a.x;
   const dy = b.y - a.y;
   const len = Math.hypot(dx, dy);
-  if (len < 1e-6) return false;
+  if (len < 1e-6) return null;
   const px = -dy / len;
   const py = dx / len;
   const cx = card.x + card.width / 2;
@@ -913,60 +913,324 @@ function nudgeCardFromLine(
   const projHalf = (Math.abs(card.width * px) + Math.abs(card.height * py)) / 2;
   const curDist = (cx - a.x) * px + (cy - a.y) * py;
   const need = projHalf + extraHalf + margin;
-  if (Math.abs(curDist) >= need) return false;
+  if (Math.abs(curDist) >= need) return null;
   const sign = curDist >= 0 ? 1 : -1;
-  card.x += px * (need - Math.abs(curDist)) * sign;
-  card.y += py * (need - Math.abs(curDist)) * sign;
-  return true;
+  const amt = (need - Math.abs(curDist)) * sign;
+  return { dx: px * amt, dy: py * amt, mag: Math.abs(amt) };
 }
 
 /**
- * The primary lever for "no connection behind a card": move the third-party
- * cards that a connection passes through up/down/left/right (perpendicular to
- * the connection) until they clear both the connection itself and its label.
- * Bounded and deterministic; card/card overlap is re-resolved by the caller.
+ * Global quality cost for a layout, used by the optimizer to accept/reject a
+ * candidate move. Weights encode the priority the user asked for: never draw a
+ * connection (or its label) behind a card, then minimise crossings; card/card
+ * overlap is treated as a hard constraint so refinement never trades a hidden
+ * edge for a visible overlap. Compactness and displacement from the clean
+ * layout (`base`) are weak tie-breakers that steer away from ugly sprawl.
  */
-function clearByMovingCards(
+function layoutCost(
   nodes: AllCanvasNodeData[],
   edges: CanvasEdgeData[],
-  opts: CleanOptions,
-  iterations = 12
-): AllCanvasNodeData[] {
-  const out = nodes.map((n) => ({ ...n })) as AllCanvasNodeData[];
-  const margin = Math.max(6, Math.round(opts.gap / 3));
-  for (let pass = 0; pass < iterations; pass++) {
-    const nodeMap = new Map(out.map((n) => [n.id, n]));
-    let moved = false;
-    for (const e of edges) {
-      const seg = edgeSegment(e, nodeMap);
-      if (!seg) continue;
-      // 1) clear the connection itself.
-      for (const n of out) {
-        if (n.type === "group" || n.id === e.fromNode || n.id === e.toNode) continue;
-        if (
-          !segmentIntersectsRect(seg.a.x, seg.a.y, seg.b.x, seg.b.y, n.x, n.y, n.width, n.height)
-        )
-          continue;
-        if (nudgeCardFromLine(n, seg.a, seg.b, 0, margin)) moved = true;
-      }
-      // 2) clear the connection label so it never sits behind a card either.
-      const label = labelText(e);
-      if (label) {
-        const box = labelBoxFromSegment(seg, label, 8);
-        const pdx = seg.b.x - seg.a.x;
-        const pdy = seg.b.y - seg.a.y;
-        const plen = Math.hypot(pdx, pdy) || 1;
-        const px = -pdy / plen;
-        const py = pdx / plen;
-        const boxProjHalf = (Math.abs(box.width * px) + Math.abs(box.height * py)) / 2;
-        for (const n of out) {
-          if (n.type === "group" || n.id === e.fromNode || n.id === e.toNode) continue;
-          if (!rectsOverlap(box, toRect(n))) continue;
-          if (nudgeCardFromLine(n, seg.a, seg.b, boxProjHalf, margin)) moved = true;
-        }
+  base?: Map<string, { x: number; y: number }>
+): number {
+  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+  const segs = edges.map((e) => edgeSegment(e, nodeMap));
+  let cost = 0;
+
+  // Card/card overlap — effectively forbidden.
+  for (let i = 0; i < nodes.length; i++)
+    for (let j = i + 1; j < nodes.length; j++)
+      if (rectsOverlap(toRect(nodes[i]!), toRect(nodes[j]!))) cost += 60000;
+
+  // Connection passing behind an unrelated card — priority #1, weighted far
+  // above crossings so a hidden edge is always eliminated even at the cost of a
+  // few crossings.
+  for (const s of segs) {
+    if (!s) continue;
+    for (const n of nodes) {
+      if (n.type === "group" || n.id === s.fromId || n.id === s.toId) continue;
+      if (segmentIntersectsRect(s.a.x, s.a.y, s.b.x, s.b.y, n.x, n.y, n.width, n.height))
+        cost += 30000;
+    }
+  }
+
+  // Connection crossings — priority #2.
+  for (let i = 0; i < segs.length; i++) {
+    const si = segs[i];
+    if (!si) continue;
+    for (let j = i + 1; j < segs.length; j++) {
+      const sj = segs[j];
+      if (sj && edgesCross(si, sj)) cost += 2500;
+    }
+  }
+
+  // Labels: never behind a card, never on top of another label or connection.
+  for (let i = 0; i < edges.length; i++) {
+    const label = labelText(edges[i]!);
+    if (!label) continue;
+    const s = segs[i];
+    if (!s) continue;
+    const box = labelBoxFromSegment(s, label);
+    for (const n of nodes) {
+      if (n.type === "group") continue;
+      if (rectsOverlap(box, toRect(n))) cost += 8000;
+    }
+    for (let j = 0; j < edges.length; j++) {
+      if (j === i) continue;
+      const s2 = segs[j];
+      if (!s2) continue;
+      if (segmentIntersectsRect(s2.a.x, s2.a.y, s2.b.x, s2.b.y, box.x, box.y, box.width, box.height))
+        cost += 3000;
+    }
+  }
+
+  // Compactness + regularity — keeps clearance from sprawling or flinging cards.
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const n of nodes) {
+    minX = Math.min(minX, n.x);
+    minY = Math.min(minY, n.y);
+    maxX = Math.max(maxX, n.x + n.width);
+    maxY = Math.max(maxY, n.y + n.height);
+    if (base) {
+      const b = base.get(n.id);
+      if (b) cost += 12 * (Math.abs(n.x - b.x) + Math.abs(n.y - b.y));
+    }
+  }
+  if (Number.isFinite(minX)) cost += (maxX - minX + maxY - minY) * 1.5;
+  return cost;
+}
+
+function hasEdgeCardHits(nodes: AllCanvasNodeData[], edges: CanvasEdgeData[]): boolean {
+  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+  for (const e of edges) {
+    const s = edgeSegment(e, nodeMap);
+    if (!s) continue;
+    for (const n of nodes) {
+      if (n.type === "group" || n.id === s.fromId || n.id === s.toId) continue;
+      if (segmentIntersectsRect(s.a.x, s.a.y, s.b.x, s.b.y, n.x, n.y, n.width, n.height)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Raw counts of every quality criterion, so iterations can be watched to confirm
+ * the optimizer is progressing (fewer behind-card, fewer crossings, no new
+ * overlaps) rather than regressing.
+ */
+function layoutMetrics(
+  nodes: AllCanvasNodeData[],
+  edges: CanvasEdgeData[]
+): { hits: number; crossings: number; cardOL: number; labelCard: number; labelLabel: number; labelEdge: number } {
+  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+  const segs = edges.map((e) => edgeSegment(e, nodeMap));
+  let hits = 0;
+  let crossings = 0;
+  let cardOL = 0;
+  let labelCard = 0;
+  let labelLabel = 0;
+  let labelEdge = 0;
+
+  for (let i = 0; i < nodes.length; i++)
+    for (let j = i + 1; j < nodes.length; j++)
+      if (rectsOverlap(toRect(nodes[i]!), toRect(nodes[j]!))) cardOL++;
+
+  for (const s of segs) {
+    if (!s) continue;
+    for (const n of nodes) {
+      if (n.type === "group" || n.id === s.fromId || n.id === s.toId) continue;
+      if (segmentIntersectsRect(s.a.x, s.a.y, s.b.x, s.b.y, n.x, n.y, n.width, n.height)) hits++;
+    }
+  }
+  for (let i = 0; i < segs.length; i++) {
+    const si = segs[i];
+    if (!si) continue;
+    for (let j = i + 1; j < segs.length; j++) {
+      const sj = segs[j];
+      if (sj && edgesCross(si, sj)) crossings++;
+    }
+  }
+  for (let i = 0; i < edges.length; i++) {
+    const label = labelText(edges[i]!);
+    if (!label) continue;
+    const s = segs[i];
+    if (!s) continue;
+    const box = labelBoxFromSegment(s, label);
+    for (const n of nodes) {
+      if (n.type === "group") continue;
+      if (rectsOverlap(box, toRect(n))) labelCard++;
+    }
+    for (let j = i + 1; j < edges.length; j++) {
+      const s2 = segs[j];
+      const l2 = labelText(edges[j]!);
+      if (!s2 || !l2) continue;
+      if (rectsOverlap(box, labelBoxFromSegment(s2, l2))) labelLabel++;
+      if (segmentIntersectsRect(s2.a.x, s2.a.y, s2.b.x, s2.b.y, box.x, box.y, box.width, box.height))
+        labelEdge++;
+    }
+  }
+  return { hits, crossings, cardOL, labelCard, labelLabel, labelEdge };
+}
+
+/**
+ * Candidate card moves that could remove a connection (or label) from behind a
+ * card: for every obstacle card intersected by an edge, its exact perpendicular
+ * clearance plus axis-aligned (up/down/left/right) variants. Deduplicated.
+ */
+function clearanceMoves(
+  out: AllCanvasNodeData[],
+  edges: CanvasEdgeData[],
+  margin: number,
+  scale: number
+): { i: number; dx: number; dy: number }[] {
+  const nodeMap = new Map(out.map((n, i) => [n.id, n]));
+  const index = new Map<string, number>();
+  out.forEach((n, i) => index.set(n.id, i));
+  const moves = new Map<string, { i: number; dx: number; dy: number }>();
+  const push = (n: AllCanvasNodeData, dx: number, dy: number): void => {
+    const i = index.get(n.id);
+    if (i === undefined) return;
+    dx *= scale;
+    dy *= scale;
+    const key = `${i}|${Math.round(dx)}|${Math.round(dy)}`;
+    moves.set(key, { i, dx, dy });
+  };
+  const addVariants = (n: AllCanvasNodeData, d: { dx: number; dy: number; mag: number }): void => {
+    push(n, d.dx, d.dy); // exact perpendicular clearance
+    const adx = Math.abs(d.dx);
+    const ady = Math.abs(d.dy);
+    if (adx >= ady) {
+      const s = d.dx >= 0 ? 1 : -1;
+      push(n, s * d.mag, 0);
+      push(n, -s * d.mag, 0);
+    } else {
+      const s = d.dy >= 0 ? 1 : -1;
+      push(n, 0, s * d.mag);
+      push(n, 0, -s * d.mag);
+    }
+  };
+
+  for (const e of edges) {
+    const seg = edgeSegment(e, nodeMap);
+    if (!seg) continue;
+    const label = labelText(e);
+    for (const n of out) {
+      if (n.type === "group" || n.id === e.fromNode || n.id === e.toNode) continue;
+      if (
+        segmentIntersectsRect(seg.a.x, seg.a.y, seg.b.x, seg.b.y, n.x, n.y, n.width, n.height)
+      ) {
+        const d = perpClearDelta(n, seg.a, seg.b, 0, margin);
+        if (d) addVariants(n, d);
       }
     }
-    if (!moved) break;
+    if (label) {
+      const box = labelBoxFromSegment(seg, label, 8);
+      const pdx = seg.b.x - seg.a.x;
+      const pdy = seg.b.y - seg.a.y;
+      const plen = Math.hypot(pdx, pdy) || 1;
+      const px = -pdy / plen;
+      const py = pdx / plen;
+      const boxProjHalf = (Math.abs(box.width * px) + Math.abs(box.height * py)) / 2;
+      for (const n of out) {
+        if (n.type === "group" || n.id === e.fromNode || n.id === e.toNode) continue;
+        if (!rectsOverlap(box, toRect(n))) continue;
+        const d = perpClearDelta(n, seg.a, seg.b, boxProjHalf, margin);
+        if (d) addVariants(n, d);
+      }
+    }
+  }
+  return Array.from(moves.values());
+}
+
+/**
+ * Coordinated, deterministic hill-climbing: each pass evaluates every candidate
+ * card move against the global layout cost and commits only the single best
+ * improvement (or nothing). Because it never accepts a globally worse move, it
+ * cannot disturb a clean layout the way a per-contact greedy jog can. If stuck
+ * with a residual behind-card, the move magnitude is doubled to reach farther.
+ */
+function refineLayout(
+  nodes: AllCanvasNodeData[],
+  edges: CanvasEdgeData[],
+  opts: CleanOptions
+): AllCanvasNodeData[] {
+  const DEBUG = typeof process !== "undefined" && !!process.env?.CLEAN_REFINE_DEBUG;
+  const out = nodes.map((n) => ({ ...n })) as AllCanvasNodeData[];
+  const base = new Map<string, { x: number; y: number }>();
+  for (const n of out) base.set(n.id, { x: n.x, y: n.y });
+  if (DEBUG) {
+    const m = layoutMetrics(out, edges);
+    console.log(`[clean.refine] start  hits=${m.hits} crossings=${m.crossings} cardOL=${m.cardOL} labelCard=${m.labelCard}`);
+  }
+  let margin = Math.max(6, Math.round(opts.gap / 3));
+  let scale = 1;
+  const maxPasses = 120;
+  const evalCap = 400;
+  let totalEvals = 0;
+  // Scale the optimisation effort to graph size so large canvases stay bounded
+  // while small/typical canvases get a full, best-result search.
+  const nodeCount = out.length;
+  const totalBudget = nodeCount > 80 ? 4000 : nodeCount > 40 ? 8000 : 15000;
+  let accepted = 0;
+  for (let pass = 0; pass < maxPasses; pass++) {
+    if (totalEvals >= totalBudget) break;
+    const cur = layoutCost(out, edges, base);
+    if (cur === 0) break;
+    const moves = clearanceMoves(out, edges, margin, scale);
+    if (moves.length === 0) {
+      if (hasEdgeCardHits(out, edges) && scale < 8) {
+        scale *= 2;
+        if (DEBUG)
+          console.log(`[clean.refine] no moves, hits remain — escalate scale=${scale}`);
+        continue;
+      }
+      break;
+    }
+    let best: { i: number; dx: number; dy: number } | null = null;
+    let bestCost = cur;
+    let tried = 0;
+    for (const mv of moves) {
+      if (++tried > evalCap) break;
+      const node = out[mv.i]!;
+      const sx = node.x;
+      const sy = node.y;
+      node.x += mv.dx;
+      node.y += mv.dy;
+      totalEvals++;
+      const c = layoutCost(out, edges, base);
+      if (c < bestCost) {
+        bestCost = c;
+        best = mv;
+      }
+      node.x = sx;
+      node.y = sy;
+    }
+    if (!best || bestCost >= cur) {
+      if (hasEdgeCardHits(out, edges) && scale < 8) {
+        scale *= 2;
+        if (DEBUG)
+          console.log(`[clean.refine] best not better, hits remain — escalate scale=${scale}`);
+        continue;
+      }
+      break;
+    }
+    out[best.i]!.x += best.dx;
+    out[best.i]!.y += best.dy;
+    accepted++;
+    if (DEBUG) {
+      const m = layoutMetrics(out, edges);
+      console.log(
+        `[clean.refine] #${accepted} moved ${out[best.i]!.id} by (${Math.round(best.dx)},${Math.round(best.dy)})  hits=${m.hits} crossings=${m.crossings} cardOL=${m.cardOL} labelCard=${m.labelCard} labelEdge=${m.labelEdge}`
+      );
+    }
+    if (bestCost === 0) break;
+    scale = 1;
+  }
+  if (DEBUG) {
+    const m = layoutMetrics(out, edges);
+    console.log(`[clean.refine] done   hits=${m.hits} crossings=${m.crossings} cardOL=${m.cardOL} labelCard=${m.labelCard} (accepted ${accepted})`);
   }
   return out;
 }
@@ -1087,10 +1351,10 @@ function fitGroups(
 
 /* ────────────────────────────── entry point ─────────────────────────── */
 
-export function cleanLayout(
+function runLayout(
   inputNodes: AllCanvasNodeData[],
   inputEdges: CanvasEdgeData[],
-  opts: CleanOptions = DEFAULT_CLEAN_OPTIONS
+  opts: CleanOptions
 ): { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport } {
   const nodes = inputNodes;
   const groups = nodes.filter((n) => n.type === "group");
@@ -1163,16 +1427,16 @@ export function cleanLayout(
   // Route connections around cards first, then give labels clear space.
   let finalEdges = optimizeEdgeClearance(placed, edgesArray);
   finalEdges = placeLabelsGlobally(placed, finalEdges);
-  // Move cards up/down/left/right so no connection (or its label) is drawn
-  // behind a card — the lever that re-seating edge sides cannot reach.
-  placed = clearByMovingCards(placed, finalEdges, opts);
+  // Coordinated cost-aware refinement: move cards up/down/left/right to clear
+  // every connection (and its label) from behind a card, minimising crossings,
+  // while never making the global picture worse. Card/card overlap is a hard
+  // constraint inside the optimizer, so this cannot disturb a clean layout.
+  placed = refineLayout(placed, finalEdges, opts);
   placed = resolveOverlaps(placed, opts.gap);
-  // Moving cards moved their faces, so re-seat sides and labels once more.
-  finalEdges = optimizeEdgeClearance(placed, edgesArray);
-  finalEdges = placeLabelsGlobally(placed, finalEdges);
-  placed = clearByMovingCards(placed, finalEdges, opts);
-  placed = resolveOverlaps(placed, opts.gap);
-  finalEdges = optimizeEdgeClearance(placed, edgesArray);
+  // Cards moved, so their faces moved: re-seat sides and labels once more,
+  // starting from the edges the optimizer already cleared (re-deriving from the
+  // original could reintroduce a behind-card the refinement removed).
+  finalEdges = optimizeEdgeClearance(placed, finalEdges);
   finalEdges = placeLabelsGlobally(placed, finalEdges);
   // Group containers are re-wrapped around their members (they are not laid out).
   const withGroups = fitGroups([...placed, ...groups], members, opts.padding);
@@ -1216,6 +1480,80 @@ export function cleanLayout(
   };
 
   return { nodes: orderedNodes, edges: finalEdges, report };
+}
+
+const ALL_DIRECTIONS: CleanDirection[] = ["top-to-bottom", "left-to-right", "balanced"];
+
+function bboxArea(nodes: AllCanvasNodeData[]): number {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const n of nodes) {
+    minX = Math.min(minX, n.x);
+    minY = Math.min(minY, n.y);
+    maxX = Math.max(maxX, n.x + n.width);
+    maxY = Math.max(maxY, n.y + n.height);
+  }
+  return Number.isFinite(minX) ? (maxX - minX) * (maxY - minY) : 0;
+}
+
+function betterReport(a: CleanReport, aArea: number, b: CleanReport, bArea: number): boolean {
+  const ka = [a.edgeCardHits, a.edgeCrossings, a.cardOverlaps, a.labelCardOverlaps, a.labelEdgeHits, aArea];
+  const kb = [b.edgeCardHits, b.edgeCrossings, b.cardOverlaps, b.labelCardOverlaps, b.labelEdgeHits, bArea];
+  for (let i = 0; i < ka.length; i++) {
+    if (ka[i]! < kb[i]!) return true;
+    if (ka[i]! > kb[i]!) return false;
+  }
+  return false;
+}
+
+/**
+ * Clean layout with automatic best-result selection. Because the cleanest
+ * layout (fewest behind-card connections, then fewest crossings) depends on how
+ * the graph is oriented and how much room it is given, this runs a bounded set
+ * of orientations and spacing scales and returns the globally best one. More
+ * expensive, but produces the best result regardless of the current settings.
+ */
+export function cleanLayout(
+  inputNodes: AllCanvasNodeData[],
+  inputEdges: CanvasEdgeData[],
+  opts: CleanOptions = DEFAULT_CLEAN_OPTIONS
+): { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport } {
+  opts = { ...DEFAULT_CLEAN_OPTIONS, ...opts };
+
+  const orientations = [opts.direction, ...ALL_DIRECTIONS.filter((d) => d !== opts.direction)];
+  // Fine sampler of clearance room so the true lexicographic optimum (fewest
+  // behind-card, then fewest crossings, then most compact) is found. Each trial
+  // is cheap, and the user asked for the best result regardless of time. Grid is
+  // coarsened for very large canvases to keep the run bounded.
+  const numNodes = inputNodes.length;
+  const GAPS =
+    numNodes > 80
+      ? [60, 120, 180, 240, 300]
+      : numNodes > 40
+        ? [40, 80, 120, 180, 240, 300]
+        : [40, 60, 80, 100, 120, 140, 160, 180, 200, 220, 240, 260, 280, 300];
+
+  let best: { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport } | null = null;
+  let bestArea = 0;
+
+  for (const direction of orientations) {
+    for (const gap of GAPS) {
+      let result: { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport };
+      try {
+        result = runLayout(inputNodes, inputEdges, { ...opts, direction, gap });
+      } catch {
+        continue;
+      }
+      const area = bboxArea(result.nodes);
+      if (!best || betterReport(result.report, area, best.report, bestArea)) {
+        best = result;
+        bestArea = area;
+      }
+    }
+  }
+  return best ?? runLayout(inputNodes, inputEdges, opts);
 }
 
 export function describeCleanReport(r: CleanReport): string {

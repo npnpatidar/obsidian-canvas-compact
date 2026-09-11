@@ -1,7 +1,7 @@
 {
 	"id": "canvas-compact",
 	"name": "Canvas Compact",
-	"version": "2.0.1",
+	"version": "2.0.2",
 	"minAppVersion": "1.4.0",
 	"description": "Clean layout for canvas — no card/label overlaps, minimal connection crossings.",
 	"author": "Sisyphus",
