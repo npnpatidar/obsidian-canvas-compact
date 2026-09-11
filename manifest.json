@@ -1,9 +1,9 @@
 {
-  "id": "canvas-compact",
-  "name": "Canvas Compact",
-  "version": "1.4.0",
-  "minAppVersion": "1.4.0",
-  "description": "Resize cards to fit content and pack to minimum area — straight-line, edge-aware, context-aware.",
-  "author": "Sisyphus",
-  "isDesktopOnly": false
+	"id": "canvas-compact",
+	"name": "Canvas Compact",
+	"version": "2.0.0",
+	"minAppVersion": "1.4.0",
+	"description": "Clean canvas layout — no card or label overlaps, minimal connection crossings.",
+	"author": "npnpatidar",
+	"isDesktopOnly": false
 }
