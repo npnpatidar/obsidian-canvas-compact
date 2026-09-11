@@ -39,7 +39,7 @@ function contextSimilarity(a: AllCanvasNodeData, b: AllCanvasNodeData): number {
 export type EdgeSide = "top" | "bottom" | "left" | "right";
 export type OptimizeMode = "shortest" | "preserve-axes";
 
-function pointForSide(node: AllCanvasNodeData, side: EdgeSide): { x: number; y: number } {
+export function pointForSide(node: AllCanvasNodeData, side: EdgeSide): { x: number; y: number } {
   switch (side) {
     case "top": return { x: node.x + node.width / 2, y: node.y };
     case "bottom": return { x: node.x + node.width / 2, y: node.y + node.height };
@@ -55,7 +55,7 @@ function sideOptions(current: string | undefined, mode: OptimizeMode): EdgeSide[
   return ["top", "bottom", "left", "right"];
 }
 
-function segmentIntersectsRect(
+export function segmentIntersectsRect(
   x1: number, y1: number, x2: number, y2: number,
   rx: number, ry: number, rw: number, rh: number
 ): boolean {

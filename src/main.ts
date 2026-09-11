@@ -3,9 +3,11 @@ import type { CanvasData, CanvasView, Canvas } from "./Canvas.d";
 import { fitAllNodes } from "./fit";
 import { packLayout, packingStats, DEFAULT_PACK_OPTIONS } from "./pack";
 import { graphPack, optimizeEdges, tidyLayout } from "./graph";
+import { cleanLayout, describeCleanReport, DEFAULT_CLEAN_OPTIONS } from "./clean";
 import type { FitOptions } from "./fit";
 import type { PackOptions } from "./pack";
 import type { OptimizeMode } from "./graph";
+import type { CleanOptions, CleanDirection } from "./clean";
 
 interface CanvasCompactSettings {
   fitMinHeight: number;
@@ -19,6 +21,10 @@ interface CanvasCompactSettings {
   optimizeEdges: boolean;
   preserveAxes: boolean;
   graphIterations: number;
+  cleanDirection: CleanDirection;
+  cleanGap: number;
+  cleanPadding: number;
+  cleanReserveLabelSpace: boolean;
 }
 
 const DEFAULT_SETTINGS: CanvasCompactSettings = {
@@ -33,6 +39,10 @@ const DEFAULT_SETTINGS: CanvasCompactSettings = {
   optimizeEdges: true,
   preserveAxes: false,
   graphIterations: 250,
+  cleanDirection: "top-to-bottom",
+  cleanGap: 60,
+  cleanPadding: 60,
+  cleanReserveLabelSpace: true,
 };
 
 function isCanvasFile(f: TFile | null): boolean {
@@ -131,6 +141,11 @@ export default class CanvasCompactPlugin extends Plugin {
       checkCallback: this.withCanvas((canvas) => this.runTidy(canvas, true, "top-to-bottom")),
     });
     this.addCommand({
+      id: "canvas-compact-clean-layout",
+      name: "Clean layout — no overlaps, minimal crossings",
+      checkCallback: this.withCanvas((canvas) => this.runClean(canvas)),
+    });
+    this.addCommand({
       id: "canvas-compact-tidy-change-dir-lr",
       name: "Tidy layout — allow changing directions (left → right)",
       checkCallback: this.withCanvas((canvas) => this.runTidy(canvas, false, "left-to-right")),
@@ -157,6 +172,12 @@ export default class CanvasCompactPlugin extends Plugin {
               .setTitle("Canvas Compact: Fit + Graph Pack (edge-aware)")
               .setIcon("share-2")
               .onClick(async () => { await this.fitAndGraphPackFile(file as TFile); })
+          );
+          (menu as Menu).addItem((item) =>
+            item
+              .setTitle("Canvas Compact: Clean layout (no overlaps)")
+              .setIcon("sparkles")
+              .onClick(async () => { await this.cleanLayoutFile(file as TFile); })
           );
         }
       )
@@ -342,6 +363,38 @@ export default class CanvasCompactPlugin extends Plugin {
     const dirLabel = direction === "left-to-right" ? " →" : " ↓";
     const modeLabel = preserveDirection ? " (preserve direction)" : " (allow direction change)";
     new Notice(`Tidy layout${modeLabel}${dirLabel}: ${tidied.length} cards, ${edges.length} edges — total edge length ${beforeLen}→${afterLen}px`);
+  }
+
+  private cleanOptions(): CleanOptions {
+    return {
+      ...DEFAULT_CLEAN_OPTIONS,
+      gap: this.settings.cleanGap,
+      padding: this.settings.cleanPadding,
+      direction: this.settings.cleanDirection,
+      reserveLabelSpace: this.settings.cleanReserveLabelSpace,
+    };
+  }
+
+  private async runClean(canvas: Canvas): Promise<void> {
+    const data = canvas.getData() as CanvasData;
+    if (data.nodes.length === 0) { new Notice("Canvas is empty."); return; }
+    const { nodes, edges, report } = cleanLayout([...data.nodes], [...data.edges], this.cleanOptions());
+    canvas.setData({ ...data, nodes, edges });
+    canvas.requestSave(false);
+    new Notice(describeCleanReport(report));
+  }
+
+  private async cleanLayoutFile(file: TFile): Promise<void> {
+    const raw = await this.app.vault.cachedRead(file);
+    let data: CanvasData;
+    try { data = JSON.parse(raw) as CanvasData; } catch { new Notice("Invalid canvas file"); return; }
+    const { nodes, edges, report } = cleanLayout([...data.nodes], [...data.edges], this.cleanOptions());
+    data.nodes = nodes;
+    data.edges = edges;
+    await this.app.vault.modify(file, JSON.stringify(data, null, 2));
+    const view = getActiveCanvasView(this.app);
+    if (view && view.file.path === file.path) { view.canvas.setData(data); view.canvas.requestSave(false); }
+    new Notice(describeCleanReport(report));
   }
 
   // ── File (when canvas not open) ──

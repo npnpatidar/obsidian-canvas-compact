@@ -20,14 +20,31 @@ Resize each canvas card to fit its content and pack all cards to take minimum sp
 | `Optimize connections (nearest edges)` | Shortest-path or preserve-axes edge re-attachment |
 | `Pack layout — edge-aware (minimize area + connections)` | Force-layout per connected component + pack clusters |
 | `Fit + Graph Pack (edge-aware compact)` | **Recommended for connected canvases** — fit, then edge-aware pack |
+| `Clean layout — no overlaps, minimal crossings` | Lays out each cluster so no card or label overlaps and connections don't cross (zero crossings for trees/planar graphs); reports any residual |
 
-Also adds file menu: `Fit + Pack` and `Fit + Graph Pack (edge-aware)` on any `.canvas` file.
+Also adds file menu: `Fit + Pack`, `Fit + Graph Pack (edge-aware)` and `Clean layout` on any `.canvas` file.
+
+### Clean layout guarantees
+
+Connection crossings are topological, not cosmetic: Obsidian draws an edge as a bezier between two
+side anchors, so a **non-planar** connection graph (e.g. five cards all connected to each other)
+*cannot* be drawn without crossings. Clean layout therefore:
+
+- **always** eliminates card/card overlap;
+- **always** eliminates label/label and label/card overlap (widening spacing to make room);
+- lays out trees, forests and planar graphs with **zero** crossings, and minimises crossings otherwise;
+- reports whatever it could not remove in the notice, e.g. `residual: 2 connection crossings`.
+
+Layout is deterministic (no force simulation): a BFS spanning tree is placed with a layered contour
+algorithm that is provably crossing-free, then the cycle-closing edges are routed by side choice and a
+bounded local search that only ever reduces crossings.
 
 ## Settings
 
 - Minimum / maximum height, snap to grid
 - Gap / outer padding, strategy, sort order, masonry columns
 - **Connections:** optimize toggle, preserve-axes toggle, force iterations (50–600)
+- **Clean layout:** direction (top→bottom / left→right / balanced mind map), gap, outer padding, reserve space for connection labels
 
 ## Install
 
