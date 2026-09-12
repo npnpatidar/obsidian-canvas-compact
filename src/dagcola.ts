@@ -1,24 +1,41 @@
 /**
- * d3-dag + webcola integration for Obsidian Canvas layout.
+ * DagCola: d3-dag + webcola for Obsidian Canvas layout.
  *
- * This module provides:
- * 1. Layered (Sugiyama) layout via d3-dag — optimal crossing minimization
- * 2. Constraint-based refinement via webcola — hard guarantees for:
- *    - No node overlaps
- *    - Edge separation (directed flow)
- *    - Group/container containment
- *    - Label clearance
+ * The two libraries have different jobs, and both of them matter:
  *
- * Note: webcola refinement is experimental and currently disabled by default
- * due to issues with constraint satisfaction. The d3-dag layout alone
- * provides excellent results with optimal crossing minimization.
+ * 1. **d3-dag** does the ranked work. Each cluster is laid out with a Sugiyama
+ *    layered layout: longest-path layering (cycles are handled by ignoring
+ *    back-edges), crossing minimisation (exact below the configured threshold,
+ *    a fast two-layer heuristic above it), and coordinate assignment.
+ *    `top-to-bottom`, `left-to-right` and `balanced` (mind-map) orientations are
+ *    produced here.
+ *
+ * 2. **webcola** does the constraint work. Starting from the d3-dag positions it
+ *    settles the cluster into a tighter arrangement that satisfies hard
+ *    separation constraints: no card overlaps, every connection pointing the way
+ *    the layering says it does, and each canvas group's cards kept together.
+ *    A refinement is kept only when it is still overlap-free and smaller than
+ *    the layered layout, so webcola can tighten a cluster but never spoil one.
+ *
+ * Both are finished by the same tail as the Clean engine
+ * (`layoutComponents` in clean.ts): cluster packing, connection routing, label
+ * placement, the cost-aware refinement pass, and verification.
  */
 
 import type { AllCanvasNodeData, CanvasEdgeData } from "./Canvas.d";
 import type { CleanOptions, CleanDirection, CleanReport } from "./clean";
-import { verifyCleanLayout, describeCleanReport, DEFAULT_CLEAN_OPTIONS } from "./clean";
-import { connectedComponents, pointForSide, type EdgeSide } from "./graph";
-import { maxRectsPack, type PackOptions } from "./pack";
+import {
+  verifyCleanLayout,
+  DEFAULT_CLEAN_OPTIONS,
+  layoutComponents,
+  computeGroupMembers,
+  bboxArea,
+  betterReport,
+  groupPadding,
+  assignSidesByGeometry,
+  type LaidComponent,
+} from "./clean";
+import { connectedComponents } from "./graph";
 import {
   graphConnect,
   sugiyama,
@@ -28,567 +45,710 @@ import {
   coordSimplex,
   coordGreedy,
   type GraphNode,
-  type GraphLink,
-  type LayoutResult,
 } from "d3-dag";
-import { Layout, type Link, type Node, type Group } from "webcola";
+import { Layout, type Node, type Link, type Group } from "webcola";
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Type definitions
+// Options
+// ──────────────────────────────────────────────────────────────────────────────
+
+/** Component size at or below which crossing minimisation is solved exactly. */
+export const DEFAULT_EXACT_DECROSS = 30;
+/** `decrossOpt` is exponential; never let a setting push a run past this. */
+const MAX_EXACT_DECROSS = 60;
+/** Above this, coordinate assignment falls back to the fast heuristic. */
+const SIMPLEX_LIMIT = 120;
+
+export interface DagColaOptions extends Partial<CleanOptions> {
+  /** Refine each cluster with webcola's constraint solver (default: true). */
+  useColaRefinement?: boolean;
+  /** Crossing minimisation is exact for clusters up to this size. */
+  exactDecrossThreshold?: number;
+}
+
+interface ResolvedOptions {
+  clean: CleanOptions;
+  exactDecross: number;
+  useCola: boolean;
+  direction: CleanDirection;
+}
+
+function resolveOptions(options: DagColaOptions): ResolvedOptions {
+  const clean: CleanOptions = { ...DEFAULT_CLEAN_OPTIONS, ...options };
+  const requested = options.exactDecrossThreshold ?? DEFAULT_EXACT_DECROSS;
+  return {
+    clean,
+    exactDecross: Math.min(MAX_EXACT_DECROSS, Math.max(2, Math.round(requested))),
+    useCola: options.useColaRefinement ?? true,
+    direction: clean.direction,
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// d3-dag: Sugiyama layered layout per cluster
 // ──────────────────────────────────────────────────────────────────────────────
 
 interface DagNodeDatum {
   id: string;
   width: number;
   height: number;
-  type?: string;
   original: AllCanvasNodeData;
 }
 
 interface DagLinkDatum {
   source: string;
   target: string;
-  original: CanvasEdgeData;
 }
 
 type DagGraphNode = GraphNode<DagNodeDatum, DagLinkDatum>;
-type DagGraphLink = GraphLink<DagNodeDatum, DagLinkDatum>;
 
-// webcola node/link with our data
+/** Shift a cluster so its bounding box starts at the origin. */
+function normalise(nodes: AllCanvasNodeData[]): AllCanvasNodeData[] {
+  if (nodes.length === 0) return nodes;
+  const minX = Math.min(...nodes.map((n) => n.x));
+  const minY = Math.min(...nodes.map((n) => n.y));
+  return nodes.map((n) => ({ ...n, x: n.x - minX, y: n.y - minY }));
+}
+
+function labelText(edge: CanvasEdgeData): string {
+  const label = (edge as { label?: unknown }).label;
+  return typeof label === "string" ? label : "";
+}
+
+/**
+ * Spacing actually used for a cluster: widened to fit connection labels when the
+ * caller asked for label space, matching the Clean engine's estimate of a
+ * rendered label box. Resolved once per cluster and then used by *both* engines,
+ * so d3-dag lays out at that spacing and webcola keeps exactly that spacing
+ * rather than squeezing it away again.
+ */
+function clusterGap(compEdges: CanvasEdgeData[], opts: CleanOptions): number {
+  const gap = opts.gap;
+  if (!opts.reserveLabelSpace) return gap;
+  const labels = compEdges.map(labelText).filter((l) => l.length > 0);
+  if (labels.length === 0) return gap;
+  let maxLabelW = 0;
+  let maxLabelH = 0;
+  for (const l of labels) {
+    const lines = l.split("\n");
+    maxLabelW = Math.max(maxLabelW, Math.max(...lines.map((s) => s.length)) * 7 + 16);
+    maxLabelH = Math.max(maxLabelH, lines.length * 16 + 10);
+  }
+  return Math.min(400, Math.max(gap, maxLabelW + 24, maxLabelH + 24));
+}
+
+/**
+ * Lay out one cluster with d3-dag's Sugiyama pipeline.
+ *
+ * Both axes are handled by the same call: for `left-to-right` the node extents
+ * fed to d3-dag are swapped and the resulting coordinates are transposed, so the
+ * lane spacing that guarantees separation is computed from the extent that ends
+ * up on that axis.
+ */
+function layeredCluster(
+  compNodes: AllCanvasNodeData[],
+  compEdges: CanvasEdgeData[],
+  direction: "top-to-bottom" | "left-to-right",
+  exactDecross: number,
+  gap: number
+): AllCanvasNodeData[] {
+  if (compNodes.length <= 1) return normalise(compNodes);
+
+  const leftToRight = direction === "left-to-right";
+  const dataById = new Map<string, DagNodeDatum>(
+    compNodes.map((n) => [n.id, { id: n.id, width: n.width, height: n.height, original: n }])
+  );
+
+  // Self-connections are not edges in a DAG and d3-dag rejects them.
+  const linkData: DagLinkDatum[] = compEdges
+    .filter((e) => e.fromNode !== e.toNode && dataById.has(e.fromNode) && dataById.has(e.toNode))
+    .map((e) => ({ source: e.fromNode, target: e.toNode }));
+
+  const graph = graphConnect()
+    .sourceId((d: DagLinkDatum) => d.source)
+    .targetId((d: DagLinkDatum) => d.target)
+    .nodeDatum((id: string) => dataById.get(id) ?? { id, width: 100, height: 50, original: {} as AllCanvasNodeData })(
+      linkData
+    );
+
+  // d3-dag reserves `nodeSize` per node and adds `.gap()` spacing on top, so the
+  // node's own extents must be given without the gap added in.
+  const sizeOf = (node: DagGraphNode): readonly [number, number] =>
+    leftToRight ? [node.data.height, node.data.width] : [node.data.width, node.data.height];
+
+  const exact = compNodes.length <= exactDecross;
+  sugiyama()
+    .nodeSize(sizeOf)
+    .gap([gap, gap])
+    .layering(layeringLongestPath())
+    .decross(exact ? decrossOpt() : decrossTwoLayer())
+    .coord(compNodes.length <= SIMPLEX_LIMIT ? coordSimplex() : coordGreedy())(graph);
+
+  // d3-dag stores the assigned centre in `ux`/`uy`; `x`/`y` throw while unset.
+  const positioned = new Map<string, DagGraphNode>();
+  for (const node of graph.nodes()) positioned.set(node.data.id, node);
+
+  const placed = compNodes.map((n) => {
+    const node = positioned.get(n.id);
+    if (!node || node.ux === undefined || node.uy === undefined) return { ...n } as AllCanvasNodeData;
+    const cx = node.ux;
+    const cy = node.uy;
+    // Transposed for left-to-right: the lane axis becomes y, the rank axis x.
+    return (
+      leftToRight
+        ? { ...n, x: cy - n.width / 2, y: cx - n.height / 2 }
+        : { ...n, x: cx - n.width / 2, y: cy - n.height / 2 }
+    ) as AllCanvasNodeData;
+  });
+
+  return normalise(placed);
+}
+
+/**
+ * Mind-map orientation: split the root's branches into two wings, lay each wing
+ * out independently as a layered cluster, mirror one of them, and stand them
+ * side by side with the root centred above. The wings occupy disjoint x ranges
+ * and sit entirely below the root, so the result cannot self-overlap.
+ */
+function balancedCluster(
+  compNodes: AllCanvasNodeData[],
+  compEdges: CanvasEdgeData[],
+  exactDecross: number,
+  gap: number
+): AllCanvasNodeData[] {
+  const fallback = () => layeredCluster(compNodes, compEdges, "top-to-bottom", exactDecross, gap);
+  if (compNodes.length <= 2) return fallback();
+
+  const childrenOf = (id: string): string[] =>
+    compEdges.filter((e) => e.fromNode === id && e.toNode !== id).map((e) => e.toNode);
+
+  const root = compNodes.find((n) => !compEdges.some((e) => e.toNode === n.id && e.fromNode !== n.id));
+  if (!root) return fallback();
+
+  const ordered = [...new Set(childrenOf(root.id))]
+    .map((id) => compNodes.find((n) => n.id === id))
+    .filter((n): n is AllCanvasNodeData => !!n)
+    .sort((a, b) => a.x - b.x || a.y - b.y);
+  if (ordered.length < 2) return fallback();
+
+  // Walk out from each wing's branches; every other card must be reachable from
+  // exactly one of them or the graph is not a single-rooted tree and the plain
+  // layered layout is the better answer.
+  const sideOf = new Map<string, "left" | "right">();
+  const assign = (ids: string[], side: "left" | "right"): void => {
+    const stack = [...ids];
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (sideOf.has(id) || id === root.id) continue;
+      sideOf.set(id, side);
+      stack.push(...childrenOf(id));
+    }
+  };
+  const half = Math.ceil(ordered.length / 2);
+  assign(ordered.slice(0, half).map((n) => n.id), "right");
+  assign(ordered.slice(half).map((n) => n.id), "left");
+  if (sideOf.size !== compNodes.length - 1) return fallback();
+
+  const wing = (side: "left" | "right"): AllCanvasNodeData[] => {
+    const nodes = compNodes.filter((n) => sideOf.get(n.id) === side);
+    const ids = new Set(nodes.map((n) => n.id));
+    return layeredCluster(
+      nodes,
+      compEdges.filter((e) => ids.has(e.fromNode) && ids.has(e.toNode)),
+      "top-to-bottom",
+      exactDecross,
+      gap
+    );
+  };
+  const right = wing("right");
+  const left = wing("left");
+  if (left.length === 0 || right.length === 0) return fallback();
+
+  const leftSpan = Math.max(...left.map((n) => n.x + n.width));
+  const mirrored = left.map((n) => ({ ...n, x: leftSpan - n.x - n.width }));
+  const leftWidth = Math.max(...mirrored.map((n) => n.x + n.width));
+  const rightWidth = Math.max(...right.map((n) => n.x + n.width));
+  const rowGap = Math.max(gap, 40);
+  const wingY = root.height + rowGap;
+  // Centre the root over whichever wing is wider, then flank it with both.
+  const rootX = Math.max(leftWidth, rightWidth) + rowGap;
+  const leftX = rootX - rowGap - leftWidth;
+
+  return normalise([
+    { ...root, x: rootX, y: 0 } as AllCanvasNodeData,
+    ...mirrored.map((n) => ({ ...n, x: n.x + leftX, y: n.y + wingY }) as AllCanvasNodeData),
+    ...right.map((n) => ({ ...n, x: n.x + rootX + root.width + rowGap, y: n.y + wingY }) as AllCanvasNodeData),
+  ]);
+}
+
+function layoutCluster(
+  comp: AllCanvasNodeData[],
+  compEdges: CanvasEdgeData[],
+  resolved: ResolvedOptions,
+  opts: CleanOptions
+): AllCanvasNodeData[] {
+  const gap = clusterGap(compEdges, opts);
+  return resolved.direction === "balanced"
+    ? balancedCluster(comp, compEdges, resolved.exactDecross, gap)
+    : layeredCluster(comp, compEdges, resolved.direction, resolved.exactDecross, gap);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// webcola: constraint refinement per cluster
+// ──────────────────────────────────────────────────────────────────────────────
+
 interface ColaNode extends Node {
   id: string;
-  original: AllCanvasNodeData;
+  index: number;
 }
 
 interface ColaLink extends Link<ColaNode> {
   original: CanvasEdgeData;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// d3-dag: Sugiyama layered layout
-// ──────────────────────────────────────────────────────────────────────────────
+/** A webcola separation constraint: `right` must sit at least `gap` past `left`. */
+interface Separation {
+  axis: "x" | "y";
+  left: number;
+  right: number;
+  gap: number;
+}
+
+/** A webcola alignment constraint: these nodes share one coordinate on `axis`. */
+interface Alignment {
+  type: "alignment";
+  axis: "x" | "y";
+  offsets: { node: number; offset: number }[];
+}
 
 /**
- * Configure and run d3-dag Sugiyama layout on a component.
- * Returns positioned nodes (x, y in component-local coordinates).
+ * Where each card sits in the layered layout: which rank (row) and its position
+ * within that rank.
+ *
+ * Read off the geometry rather than out of d3-dag internals — same-rank cards are
+ * centred on the same flow coordinate, and their order across the rank is their
+ * cross-axis order. This works for every orientation, including the two
+ * independently laid-out wings of a balanced mind map.
  */
-function runSugiyamaLayout(
-  compNodes: AllCanvasNodeData[],
-  compEdges: CanvasEdgeData[],
-  opts: CleanOptions
-): { nodes: AllCanvasNodeData[]; width: number; height: number } {
-  if (compNodes.length === 0) return { nodes: [], width: 0, height: 0 };
-  if (compNodes.length === 1) {
-    const n = compNodes[0]!;
-    return { nodes: [{ ...n, x: 0, y: 0 }], width: n.width, height: n.height };
-  }
+export function clusterRanks(
+  cards: AllCanvasNodeData[],
+  leftToRight: boolean
+): Map<string, { rank: number; order: number }> {
+  const main = (n: AllCanvasNodeData): number =>
+    leftToRight ? n.x + n.width / 2 : n.y + n.height / 2;
+  const cross = (n: AllCanvasNodeData): number =>
+    leftToRight ? n.y + n.height / 2 : n.x + n.width / 2;
 
-  // Build node data map
-  const nodeDataMap = new Map<string, DagNodeDatum>();
-  for (const n of compNodes) {
-    nodeDataMap.set(n.id, {
-      id: n.id,
-      width: n.width,
-      height: n.height,
-      type: n.type,
-      original: n,
-    });
-  }
-
-  const linkData: DagLinkDatum[] = compEdges.map((e) => ({
-    source: e.fromNode,
-    target: e.toNode,
-    original: e,
-  }));
-
-  // Create graph using graphConnect with custom accessors
-  const builder = graphConnect()
-    .sourceId((d: DagLinkDatum) => d.source)
-    .targetId((d: DagLinkDatum) => d.target)
-    .nodeDatum((id: string) => nodeDataMap.get(id) ?? { id, width: 100, height: 50, original: {} as AllCanvasNodeData });
-
-  const graph = builder(linkData);
-
-  // Calculate gap with label space reservation (matching clean.ts logic)
-  let gap = opts.gap;
-  if (opts.reserveLabelSpace) {
-    const labels = compEdges.map((e) => labelText(e)).filter((l) => l.length > 0);
-    if (labels.length > 0) {
-      let maxLabelW = 0;
-      let maxLabelH = 0;
-      for (const l of labels) {
-        const lines = l.split("\n");
-        maxLabelW = Math.max(maxLabelW, Math.max(...lines.map((s) => s.length)) * 7 + 16);
-        maxLabelH = Math.max(maxLabelH, lines.length * 16 + 10);
-      }
-      gap = Math.min(400, Math.max(gap, maxLabelW + 24, maxLabelH + 24));
+  const ranks: AllCanvasNodeData[][] = [];
+  let lastCentre = Number.NaN;
+  for (const n of [...cards].sort((a, b) => main(a) - main(b))) {
+    const centre = main(n);
+    if (ranks.length === 0 || Math.abs(centre - lastCentre) > 1) {
+      ranks.push([]);
+      lastCentre = centre;
     }
+    ranks[ranks.length - 1]!.push(n);
   }
 
-  // Create Sugiyama layout - chain all config to avoid TS type narrowing issues
-  const layout = sugiyama()
-    .nodeSize((node: DagGraphNode): readonly [number, number] => [
-      node.data.width + gap,
-      node.data.height + gap,
-    ])
-    .gap([gap, gap])
-    .layering(layeringLongestPath())
-    .decross(compNodes.length <= 30 ? decrossOpt() : decrossTwoLayer())
-    .coord(compNodes.length <= 50 ? coordSimplex() : coordGreedy());
-
-  // Run layout
-  const result: LayoutResult = layout(graph);
-
-  // Extract positions back to our node format
-  // d3-dag positions nodes at their center (x, y), we use top-left
-  const positioned: AllCanvasNodeData[] = compNodes.map((n) => {
-    const dagNode = [...graph.nodes()].find((dn) => dn.data.id === n.id);
-    if (!dagNode || dagNode.ux === undefined || dagNode.uy === undefined) {
-      return { ...n, x: 0, y: 0 };
-    }
-    return {
-      ...n,
-      x: dagNode.x - n.width / 2,
-      y: dagNode.y - n.height / 2,
-    };
+  const out = new Map<string, { rank: number; order: number }>();
+  ranks.forEach((row, rank) => {
+    [...row]
+      .sort((a, b) => cross(a) - cross(b))
+      .forEach((n, order) => out.set(n.id, { rank, order }));
   });
-
-  // Normalize to origin
-  const minX = Math.min(...positioned.map((n) => n.x));
-  const minY = Math.min(...positioned.map((n) => n.y));
-  const normalized = positioned.map((n) => ({
-    ...n,
-    x: n.x - minX,
-    y: n.y - minY,
-  }));
-
-  return {
-    nodes: normalized,
-    width: result.width,
-    height: result.height,
-  };
+  return out;
 }
 
-function labelText(edge: CanvasEdgeData): string {
-  const l = (edge as { label?: unknown }).label;
-  return typeof l === "string" ? l : "";
-}
+/** Pairwise ordering constraints above which the layered structure is left unpinned. */
+const MAX_ORDERING_CONSTRAINTS = 20000;
 
-// ──────────────────────────────────────────────────────────────────────────────
-// webcola: Constraint-based refinement (experimental, disabled by default)
-// ──────────────────────────────────────────────────────────────────────────────
 
 /**
- * Generate separation constraints for directed edges to enforce flow direction.
+ * Constraints that pin the layered structure so a refinement can tighten the
+ * layout but never permute it.
+ *
+ * Crossings come from the *order* of cards, not their exact spacing, so every
+ * pair is pinned at the minimum legal separation and every rank is held on one
+ * line. That freezes the drawing's structure while leaving webcola free to pull
+ * ranks together — which is the slack worth reclaiming, because d3-dag sizes a
+ * rank's band by the tallest card in it, so a short card following a tall one is
+ * held further away than its own extents require. Without the alignment the
+ * solver is free to slide cards out of their rows, which silently destroys the
+ * crossing minimality the whole layout was built for.
  */
-function generateFlowConstraints(
-  nodes: ColaNode[],
-  edges: ColaLink[],
-  direction: CleanDirection,
-  gap: number
-): any[] {
-  const constraints: any[] = [];
+function orderingConstraints(
+  cards: AllCanvasNodeData[],
+  colaNodes: ColaNode[],
+  ranks: Map<string, { rank: number; order: number }>,
+  axis: "x" | "y"
+): (Separation | Alignment)[] {
+  const nodeOf = new Map<string, ColaNode>();
+  for (const node of colaNodes) nodeOf.set(node.id, node);
 
-  for (const edge of edges) {
-    const sourceNode = edge.source as unknown as ColaNode;
-    const targetNode = edge.target as unknown as ColaNode;
-    const source = nodes.find((n) => n.id === sourceNode.id);
-    const target = nodes.find((n) => n.id === targetNode.id);
-    if (!source || !target) continue;
-
-    const axis = direction === "left-to-right" ? "x" : "y";
-    const sep = gap + 10;
-
-    constraints.push({
-      type: "separation",
-      axis,
-      left: source.id,
-      right: target.id,
-      gap: sep,
-      equality: false,
-    });
+  const rows = new Map<number, ColaNode[]>();
+  for (const card of cards) {
+    const info = ranks.get(card.id);
+    const node = nodeOf.get(card.id);
+    if (!info || !node) continue;
+    const row = rows.get(info.rank);
+    if (row) row.push(node);
+    else rows.set(info.rank, [node]);
   }
+  const ordered = [...rows.entries()].sort((a, b) => a[0] - b[0]).map(([, row]) => row);
+  if (ordered.length === 0) return [];
+
+  const crossAxis: "x" | "y" = axis === "x" ? "y" : "x";
+  // ColaNode extents already carry the requested spacing (see colaRefine).
+  const extent = (n: ColaNode, on: "x" | "y"): number => (on === "x" ? n.width ?? 0 : n.height ?? 0);
+
+  const constraints: (Separation | Alignment)[] = [];
+
+  // Within a rank: cards share one line and stay side by side, in the order
+  // d3-dag chose for them.
+  for (const row of ordered) {
+    const sorted = [...row].sort((a, b) => ranks.get(a.id)!.order - ranks.get(b.id)!.order);
+    if (sorted.length > 1) {
+      constraints.push({
+        type: "alignment",
+        axis,
+        offsets: sorted.map((n) => ({ node: n.index, offset: 0 })),
+      });
+    }
+    for (let i = 0; i < sorted.length; i++) {
+      for (let j = i + 1; j < sorted.length; j++) {
+        constraints.push({
+          axis: crossAxis,
+          left: sorted[i]!.index,
+          right: sorted[j]!.index,
+          gap: (extent(sorted[i]!, crossAxis) + extent(sorted[j]!, crossAxis)) / 2,
+        });
+      }
+    }
+  }
+
+  // Between neighbouring ranks: every card of one rank stays downstream of every
+  // card of the rank before it, whatever their sizes.
+  for (let r = 0; r + 1 < ordered.length; r++) {
+    for (const above of ordered[r]!) {
+      for (const below of ordered[r + 1]!) {
+        constraints.push({
+          axis,
+          left: above.index,
+          right: below.index,
+          gap: (extent(above, axis) + extent(below, axis)) / 2,
+        });
+      }
+    }
+  }
+
   return constraints;
 }
 
 /**
- * Run webcola constraint solver on a set of nodes and edges.
- * Returns refined positions satisfying all constraints.
- * NOTE: Currently experimental - may not satisfy all constraints reliably.
+ * webcola reads groups as a hierarchy of node indices: `leaves` and `groups`
+ * are indices into the node array and the group array respectively, and passing
+ * indices (rather than objects) is what makes webcola mark each node's `parent`
+ * and therefore generate the containing constraints.
  */
-function runColaRefinement(
-  nodes: AllCanvasNodeData[],
-  edges: CanvasEdgeData[],
-  opts: CleanOptions,
-  groupMembers: Map<string, Set<string>>
-): AllCanvasNodeData[] {
-  if (nodes.length <= 1) return nodes;
+function buildColaGroups(
+  compNodes: AllCanvasNodeData[],
+  indexOf: Map<string, number>,
+  groupMembers: Map<string, Set<string>>,
+  padding: number
+): Group[] {
+  // Only groups that actually hold cards of this cluster take part.
+  const groups = compNodes.filter(
+    (n) => n.type === "group" && [...(groupMembers.get(n.id) ?? [])].some((id) => indexOf.has(id))
+  );
+  if (groups.length === 0) return [];
 
-  const regularNodes = nodes.filter((n) => n.type !== "group");
-  const groupNodes = nodes.filter((n) => n.type === "group");
+  const groupIndex = new Map(groups.map((g, i) => [g.id, i]));
 
-  if (regularNodes.length === 0) return nodes;
-
-  // Create webcola nodes
-  const colaNodes: ColaNode[] = regularNodes.map((n) => ({
-    id: n.id,
-    x: n.x + n.width / 2,
-    y: n.y + n.height / 2,
-    width: n.width,
-    height: n.height,
-    fixed: 0,
-    original: n,
-  }));
-
-  const colaGroups: Group[] = groupNodes.map((g) => ({
-    id: g.id,
-    padding: opts.padding,
-    leaves: [],
-    groups: [],
-    bounds: undefined,
-  }));
-
-  // Create webcola links - must reference actual node objects
-  const nodeById = new Map(colaNodes.map((n) => [n.id, n]));
-  const colaLinks: ColaLink[] = edges
-    .filter((e) => nodeById.has(e.fromNode) && nodeById.has(e.toNode))
-    .map((e) => ({
-      source: nodeById.get(e.fromNode)!,
-      target: nodeById.get(e.toNode)!,
-      length: opts.gap + 20,
-      weight: 1,
-      original: e,
-    }));
-
-  // Build constraints
-  const constraints: any[] = [
-    ...generateFlowConstraints(colaNodes, colaLinks, opts.direction, opts.gap),
-  ];
-
-  // Create and configure cola layout
-  const cola = new Layout()
-    .nodes(colaNodes)
-    .groups(colaGroups)
-    .links(colaLinks)
-    .constraints(constraints)
-    .avoidOverlaps(true)
-    .handleDisconnected(true)
-    .flowLayout(opts.direction === "left-to-right" ? "x" : "y", opts.gap)
-    .convergenceThreshold(1e-3)
-    .linkDistance(opts.gap + 20)
-    .defaultNodeSize(Math.max(...regularNodes.map((n) => Math.max(n.width, n.height))));
-
-  // Run layout
-  const iterations = Math.min(50, Math.max(10, nodes.length));
-  cola.start(10, 30, iterations, 0, false, true);
-
-  // Extract positions - convert from center to top-left
-  const finalPositions = new Map<string, { x: number; y: number }>();
-  for (const n of cola.nodes() as ColaNode[]) {
-    const w = n.width ?? 100;
-    const h = n.height ?? 50;
-    finalPositions.set(n.id, { x: n.x - w / 2, y: n.y - h / 2 });
+  // A canvas group's parent is the smallest group enclosing its centre — the
+  // same rule Obsidian uses when a group is dropped inside another.
+  const parentOf = new Map<string, string>();
+  for (const g of groups) {
+    const cx = g.x + g.width / 2;
+    const cy = g.y + g.height / 2;
+    let best: AllCanvasNodeData | null = null;
+    for (const other of groups) {
+      if (other.id === g.id) continue;
+      const inside =
+        cx >= other.x && cx <= other.x + other.width && cy >= other.y && cy <= other.y + other.height;
+      if (!inside) continue;
+      if (!best || other.width * other.height < best.width * best.height) best = other;
+    }
+    if (best) parentOf.set(g.id, best.id);
   }
 
-  // Apply to all nodes (including groups)
-  const result: AllCanvasNodeData[] = nodes.map((n) => {
-    const pos = finalPositions.get(n.id);
-    if (!pos) return n;
-    return { ...n, x: pos.x, y: pos.y };
-  });
+  const childGroups = new Map<string, string[]>();
+  for (const g of groups) {
+    const parent = parentOf.get(g.id);
+    if (parent) childGroups.set(parent, [...(childGroups.get(parent) ?? []), g.id]);
+  }
 
-  // Normalize to origin
-  const minX = Math.min(...result.map((n) => n.x));
-  const minY = Math.min(...result.map((n) => n.y));
-  return result.map((n) => ({ ...n, x: n.x - minX, y: n.y - minY }));
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Edge side optimization (post-layout)
-// ──────────────────────────────────────────────────────────────────────────────
-
-function optimizeEdgeSides(
-  nodes: AllCanvasNodeData[],
-  edges: CanvasEdgeData[],
-  _mode: "shortest" | "preserve-axes" = "shortest"
-): CanvasEdgeData[] {
-  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
-  const sides: EdgeSide[] = ["top", "bottom", "left", "right"];
-
-  return edges.map((edge) => {
-    const from = nodeMap.get(edge.fromNode);
-    const to = nodeMap.get(edge.toNode);
-    if (!from || !to) return edge;
-
-    let best: { fromSide: EdgeSide; toSide: EdgeSide; dist: number } | null = null;
-
-    for (const fs of sides) {
-      const fp = pointForSide(from, fs);
-      for (const ts of sides) {
-        const tp = pointForSide(to, ts);
-        const dist = (tp.x - fp.x) ** 2 + (tp.y - fp.y) ** 2;
-        if (!best || dist < best.dist) {
-          best = { fromSide: fs, toSide: ts, dist };
-        }
-      }
+  /** Cards owned by a nested group belong to that group, not to its ancestor. */
+  const nestedCards = new Map<string, Set<string>>();
+  const collectNested = (id: string, seen: Set<string> = new Set()): Set<string> => {
+    const cached = nestedCards.get(id);
+    if (cached) return cached;
+    const out = new Set<string>();
+    nestedCards.set(id, out);
+    if (seen.has(id)) return out;
+    seen.add(id);
+    for (const child of childGroups.get(id) ?? []) {
+      for (const member of groupMembers.get(child) ?? []) out.add(member);
+      for (const member of collectNested(child, seen)) out.add(member);
     }
-    if (!best || (best.fromSide === edge.fromSide && best.toSide === edge.toSide)) return edge;
-    return { ...edge, fromSide: best.fromSide, toSide: best.toSide };
+    return out;
+  };
+
+  const clusterPadding = groupPadding(padding);
+  return groups.map((g) => {
+    const nested = collectNested(g.id);
+    const leaves = [...(groupMembers.get(g.id) ?? [])]
+      .filter((id) => indexOf.has(id) && !nested.has(id))
+      .map((id) => indexOf.get(id)!);
+    return {
+      id: g.id,
+      padding: clusterPadding,
+      leaves,
+      groups: (childGroups.get(g.id) ?? []).map((id) => groupIndex.get(id)!),
+    } as unknown as Group;
   });
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Main entry: dagcolaLayout
-// ──────────────────────────────────────────────────────────────────────────────
-
-export interface DagColaOptions extends Partial<CleanOptions> {
-  /** Use webcola refinement after d3-dag layout (default: false - experimental) */
-  useColaRefinement?: boolean;
-  /** Maximum component size for exact crossing minimization (default: 30) */
-  exactDecrossThreshold?: number;
 }
 
 /**
- * Main layout function: d3-dag layered layout + optional webcola constraint refinement.
+ * Refine one cluster with webcola, starting from the layered positions.
  *
- * Pipeline:
- * 1. Split into connected components
- * 2. For each component: d3-dag Sugiyama layered layout
- * 3. Pack components using MaxRects
- * 4. Optional: webcola refinement with constraints (non-overlap, flow, groups)
- * 5. Edge side optimization
- * 6. Quality verification
+ * Constraints handed to webcola are all index-based, which is the only form its
+ * projection solver understands:
+ *  - non-overlap comes from `avoidOverlaps` over the real card extents,
+ *  - flow direction comes from `flowLayout`, whose generated separation
+ *    constraints are cycle-safe (edges inside a strongly connected component are
+ *    skipped) and are given a centre-to-centre gap covering both cards' extents,
+ *  - group containment comes from the group hierarchy built above.
+ *
+ * No unconstrained iterations are run: the d3-dag positions are the starting
+ * point and must survive, so only the constrained phases move anything.
+ */
+export function colaRefine(
+  compNodes: AllCanvasNodeData[],
+  compEdges: CanvasEdgeData[],
+  direction: CleanDirection,
+  groupMembers: Map<string, Set<string>>,
+  gap: number,
+  padding: number,
+  iterations?: number
+): AllCanvasNodeData[] {
+  const cards = compNodes.filter((n) => n.type !== "group");
+  if (cards.length < 2) return compNodes;
+
+  const indexOf = new Map<string, number>(cards.map((n, i) => [n.id, i]));
+  // webcola enforces separation on the boxes it is handed, so every card's box is
+  // inflated by the requested spacing. The solver then keeps a real gap between
+  // cards instead of letting them touch, which is what stops a refinement from
+  // silently throwing away the caller's spacing (and with it the room that
+  // connection labels need).
+  const colaNodes: ColaNode[] = cards.map((n, i) => ({
+    id: n.id,
+    index: i,
+    // webcola works with card centres, the canvas stores top-left corners.
+    x: n.x + n.width / 2,
+    y: n.y + n.height / 2,
+    width: n.width + gap,
+    height: n.height + gap,
+  }));
+
+  const colaLinks = compEdges
+    .filter((e) => e.fromNode !== e.toNode && indexOf.has(e.fromNode) && indexOf.has(e.toNode))
+    .map((e) => ({
+      source: colaNodes[indexOf.get(e.fromNode)!]!,
+      target: colaNodes[indexOf.get(e.toNode)!]!,
+      weight: 1,
+      original: e,
+    })) as unknown as ColaLink[];
+
+  const axis = direction === "left-to-right" ? "x" : "y";
+  const extentOn = (node: Node): number => (axis === "y" ? node.height ?? 0 : node.width ?? 0);
+  // Centre-to-centre minimum for a connection: the two half-extents, which the
+  // inflation above has already loaded with the requested spacing.
+  const separation = (link: ColaLink): number => (extentOn(link.source) + extentOn(link.target)) / 2;
+
+  const layout = new Layout()
+    .nodes(colaNodes)
+    .links(colaLinks)
+    .avoidOverlaps(true)
+    .handleDisconnected(false) // one connected cluster at a time
+    .convergenceThreshold(1e-3)
+    // Pull connected cards to the tightest spacing the constraints allow.
+    .linkDistance(separation as unknown as (t: Link<Node | number>) => number);
+
+  const groups = buildColaGroups(compNodes, indexOf, groupMembers, padding);
+  if (groups.length > 0) layout.groups(groups).groupCompactness(1e-3);
+
+  // Freeze the structure the crossings were minimised for. Past the cap the
+  // structure is left unpinned and the caller's candidate comparison decides.
+  const ordering = orderingConstraints(
+    cards,
+    colaNodes,
+    clusterRanks(cards, direction === "left-to-right"),
+    axis
+  );
+  if (ordering.length > 0 && ordering.length <= MAX_ORDERING_CONSTRAINTS) layout.constraints(ordering);
+
+  layout.flowLayout(axis, separation as unknown as (t: unknown) => number);
+
+  layout.start(0, 30, iterations ?? Math.min(60, Math.max(20, cards.length * 2)), 0, false, false);
+
+  const centres = new Map<string, { x: number; y: number }>();
+  for (const node of layout.nodes() as unknown as ColaNode[]) {
+    const card = cards[node.index];
+    if (!card) continue;
+    centres.set(node.id, { x: node.x - card.width / 2, y: node.y - card.height / 2 });
+  }
+
+  return compNodes.map((n) => {
+    const centre = centres.get(n.id);
+    return centre ? ({ ...n, x: centre.x, y: centre.y } as AllCanvasNodeData) : n;
+  });
+}
+
+/**
+ * Drop a refinement that left cards on top of each other — that is never
+ * acceptable, whatever else it may have improved.
+ */
+function keepApart(
+  refined: AllCanvasNodeData[],
+  layered: AllCanvasNodeData[],
+  compEdges: CanvasEdgeData[]
+): AllCanvasNodeData[] {
+  if (refined.filter((n) => n.type !== "group").length < 2) return layered;
+  return verifyCleanLayout(refined, compEdges).cardOverlaps > 0 ? layered : refined;
+}
+
+function samePositions(a: AllCanvasNodeData[], b: AllCanvasNodeData[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i]!.id !== b[i]!.id) return false;
+    if (Math.abs(a[i]!.x - b[i]!.x) > 0.5 || Math.abs(a[i]!.y - b[i]!.y) > 0.5) return false;
+  }
+  return true;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Main entry
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Spacing scales each cluster is laid out at. How much room a canvas needs
+ * depends on connections that have to squeeze between cards, so a couple of
+ * spacings are tried and the cleanest result wins.
+ */
+const GAP_SCALES: number[] = [1, 1.5];
+
+interface Candidate {
+  label: string;
+  clusters: LaidComponent[];
+  opts: CleanOptions;
+}
+
+/**
+ * Lay out a canvas with d3-dag, refine each cluster with webcola, and finish
+ * through the shared pipeline.
+ *
+ * 1. Split cards into connected clusters (groups are containers, not subjects).
+ * 2. Per cluster: d3-dag Sugiyama layout, in the configured orientation.
+ * 3. Per cluster: webcola constraint refinement, pinned to the layered
+ *    structure so it can tighten spacing but not permute the drawing.
+ * 4. Pack the clusters and route connections/labels (shared with Clean layout).
+ * 5. Re-wrap group containers and verify.
+ *
+ * Steps 2–4 run at a couple of spacings, and the lexicographically cleanest
+ * result wins. Spacing is searched because whether a connection can be routed
+ * clear of every card depends on how much room there is, so the tightest
+ * arrangement is not always the cleanest. Every candidate — webcola's included —
+ * goes through the identical step 4, which is what lets webcola run by default:
+ * it is a second opinion, never a regression.
  */
 export function dagcolaLayout(
   inputNodes: AllCanvasNodeData[],
   inputEdges: CanvasEdgeData[],
   options: DagColaOptions = {}
 ): { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport } {
-  const opts: CleanOptions = { ...DEFAULT_CLEAN_OPTIONS, ...options };
-  const useCola = options.useColaRefinement ?? false; // Disabled by default (experimental)
-  const exactThreshold = options.exactDecrossThreshold ?? 30;
+  const resolved = resolveOptions(options);
 
-  if (inputNodes.length === 0) {
-    return { nodes: [], edges: [], report: emptyReport() };
-  }
-
-  // Separate groups
-  const groups = inputNodes.filter((n) => n.type === "group");
-  const regularNodes = inputNodes.filter((n) => n.type !== "group");
-  const groupIds = new Set(groups.map((g) => g.id));
+  const groupIds = new Set(inputNodes.filter((n) => n.type === "group").map((g) => g.id));
+  const cards = inputNodes.filter((n) => n.type !== "group");
   const layoutEdges = inputEdges.filter((e) => !groupIds.has(e.fromNode) && !groupIds.has(e.toNode));
 
-  // Compute group membership
+  const components = connectedComponents(cards, layoutEdges);
+  // Group membership is positional, so it has to be read before anything moves.
   const groupMembers = computeGroupMembers(inputNodes);
 
-  // Find connected components
-  const components = connectedComponents(regularNodes, layoutEdges);
-
-  // Layout each component with d3-dag
-  const laidComponents: { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; width: number; height: number }[] = [];
-
-  for (const comp of components) {
+  // Connections are re-seated on the sides that face each other from their new
+  // positions, so every candidate is measured on the same footing (and no
+  // candidate inherits stale sides from the canvas's previous arrangement).
+  const clustered = (comp: AllCanvasNodeData[], opts: CleanOptions): LaidComponent => {
     const ids = new Set(comp.map((n) => n.id));
     const compEdges = layoutEdges.filter((e) => ids.has(e.fromNode) && ids.has(e.toNode));
+    const nodes = layoutCluster(comp, compEdges, resolved, opts);
+    return { nodes, edges: assignSidesByGeometry(nodes, compEdges) };
+  };
 
-    const { nodes, width, height } = runSugiyamaLayout(comp, compEdges, opts);
-
-    // Optimize edge sides for this component
-    const compEdgesOptimized = optimizeEdgeSides(nodes, compEdges);
-
-    laidComponents.push({
-      nodes,
-      edges: compEdgesOptimized,
-      width,
-      height,
+  const colaVariant = (base: LaidComponent[], opts: CleanOptions): LaidComponent[] =>
+    base.map((cluster) => {
+      const refined = colaRefine(
+        cluster.nodes,
+        cluster.edges,
+        resolved.direction,
+        groupMembers,
+        clusterGap(cluster.edges, opts),
+        opts.padding
+      );
+      const nodes = keepApart(refined, cluster.nodes, cluster.edges);
+      return { nodes, edges: assignSidesByGeometry(nodes, cluster.edges) };
     });
-  }
 
-  // Pack component bounding boxes using MaxRects
-  const metas = laidComponents.map((c, i) => ({
-    id: `__dagcola_${i}`,
-    x: 0,
-    y: 0,
-    width: c.width,
-    height: c.height,
-    type: "group",
-  })) as unknown as AllCanvasNodeData[];
-
-  const packOpts: PackOptions = {
-    strategy: "maxrects",
-    gap: Math.max(opts.gap, 40),
-    padding: opts.padding,
-    sortBy: "heightDesc",
-  };
-  const packedMetas = metas.length > 0 ? maxRectsPack(metas, packOpts) : [];
-
-  // Apply component offsets
-  let placed: AllCanvasNodeData[] = [];
-  const compEdgesAll: CanvasEdgeData[] = [];
-
-  laidComponents.forEach((c, i) => {
-    const meta = packedMetas.find((m) => m.id === `__dagcola_${i}`);
-    const dx = meta ? meta.x : opts.padding;
-    const dy = meta ? meta.y : opts.padding;
-    for (const n of c.nodes) placed.push({ ...n, x: n.x + dx, y: n.y + dy });
-    compEdgesAll.push(...c.edges);
-  });
-
-  // Add any remaining edges (cross-component, groups)
-  for (const e of inputEdges) {
-    if (!compEdgesAll.some((ce) => ce.id === e.id)) compEdgesAll.push(e);
-  }
-
-  // Optional webcola refinement pass (experimental)
-  if (useCola && placed.length > 1) {
-    placed = runColaRefinement(placed, compEdgesAll, opts, groupMembers);
-    // Re-optimize sides after cola moves nodes
-    const finalEdges = optimizeEdgeSides(placed, compEdgesAll);
-    compEdgesAll.length = 0;
-    compEdgesAll.push(...finalEdges);
-  }
-
-  // Re-wrap groups around their members
-  const withGroups = fitGroups([...placed, ...groups], groupMembers, opts.padding);
-
-  // Verify quality
-  const verified = verifyCleanLayout(withGroups, compEdgesAll, groupMembers);
-  const report: CleanReport = {
-    nodes: withGroups.length,
-    edges: compEdgesAll.length,
-    components: components.length,
-    crossingFreeComponents: countCrossingFree(withGroups, compEdgesAll, components),
-    groups: groups.length,
-    ...verified,
-  };
-
-  // Restore input order
-  const byId = new Map(withGroups.map((n) => [n.id, n]));
-  const orderedNodes = inputNodes.map((n) => byId.get(n.id) ?? n);
-
-  return { nodes: orderedNodes, edges: compEdgesAll, report };
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
-function computeGroupMembers(nodes: AllCanvasNodeData[]): Map<string, Set<string>> {
-  const members = new Map<string, Set<string>>();
-  const groupNodes = nodes.filter((n) => n.type === "group");
-  for (const g of groupNodes) {
-    const set = new Set<string>();
-    for (const n of nodes) {
-      if (n.id === g.id || n.type === "group") continue;
-      const cx = n.x + n.width / 2;
-      const cy = n.y + n.height / 2;
-      if (cx >= g.x && cx <= g.x + g.width && cy >= g.y && cy <= g.y + g.height) {
-        set.add(n.id);
-      }
+  const candidates: Candidate[] = [];
+  for (const scale of GAP_SCALES) {
+    const opts: CleanOptions = { ...resolved.clean, gap: resolved.clean.gap * scale };
+    const base = components.map((comp) => clustered(comp, opts));
+    candidates.push({ label: `d3-dag ×${scale}`, clusters: base, opts });
+    if (!resolved.useCola) continue;
+    const refined = colaVariant(base, opts);
+    // Skip the tail entirely when webcola left every card where d3-dag put it.
+    if (refined.some((c, i) => !samePositions(c.nodes, base[i]!.nodes))) {
+      candidates.push({ label: `webcola ×${scale}`, clusters: refined, opts });
     }
-    members.set(g.id, set);
   }
-  return members;
-}
 
-function fitGroups(
-  nodes: AllCanvasNodeData[],
-  members: Map<string, Set<string>>,
-  padding: number
-): AllCanvasNodeData[] {
-  const byId = new Map(nodes.map((n) => [n.id, n]));
-  return nodes.map((n) => {
-    if (n.type !== "group") return n;
-    const set = members.get(n.id);
-    if (!set || set.size === 0) return n;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const id of set) {
-      const m = byId.get(id);
-      if (!m) continue;
-      minX = Math.min(minX, m.x);
-      minY = Math.min(minY, m.y);
-      maxX = Math.max(maxX, m.x + m.width);
-      maxY = Math.max(maxY, m.y + m.height);
+  const debug = typeof process !== "undefined" && !!process.env?.DAGCOLA_DEBUG;
+  let best: { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport } | null = null;
+  let bestArea = 0;
+  let chosen = "";
+  for (const candidate of candidates) {
+    const result = layoutComponents(inputNodes, inputEdges, components, candidate.clusters, candidate.opts);
+    const area = bboxArea(result.nodes);
+    if (debug) console.log(`[dagcola] ${candidate.label.padEnd(14)} ${describe(result, area)}`);
+    if (!best || betterReport(result.report, area, best.report, bestArea)) {
+      best = result;
+      bestArea = area;
+      chosen = candidate.label;
     }
-    if (!Number.isFinite(minX)) return n;
-    const p = Math.max(10, padding / 3);
-    return {
-      ...n,
-      x: minX - p,
-      y: minY - p,
-      width: maxX - minX + 2 * p,
-      height: maxY - minY + 2 * p,
-    };
-  });
-}
-
-function countCrossingFree(
-  nodes: AllCanvasNodeData[],
-  edges: CanvasEdgeData[],
-  components: AllCanvasNodeData[][]
-): number {
-  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
-  let count = 0;
-  for (const comp of components) {
-    const ids = new Set(comp.map((n) => n.id));
-    const compEdges = edges.filter((e) => ids.has(e.fromNode) && ids.has(e.toNode));
-    const segs = compEdges.map((e) => {
-      const from = nodeMap.get(e.fromNode);
-      const to = nodeMap.get(e.toNode);
-      if (!from || !to) return null;
-      return {
-        a: pointForSide(from, (e.fromSide as EdgeSide) ?? "right"),
-        b: pointForSide(to, (e.toSide as EdgeSide) ?? "left"),
-      };
-    }).filter((s): s is { a: { x: number; y: number }; b: { x: number; y: number } } => !!s);
-
-    let cross = 0;
-    for (let i = 0; i < segs.length; i++) {
-      for (let j = i + 1; j < segs.length; j++) {
-        if (segmentsCross(segs[i]!, segs[j]!)) cross++;
-      }
-    }
-    if (cross === 0) count++;
   }
-  return count;
+  if (debug) console.log(`[dagcola] -> ${chosen}`);
+  return best ?? layoutComponents(inputNodes, inputEdges, components, [], resolved.clean);
 }
 
-function segmentsCross(
-  a: { a: { x: number; y: number }; b: { x: number; y: number } },
-  b: { a: { x: number; y: number }; b: { x: number; y: number } }
-): boolean {
-  const orient = (p: { x: number; y: number }, q: { x: number; y: number }, r: { x: number; y: number }) =>
-    Math.sign((q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x));
-  const d1 = orient(a.a, a.b, b.a);
-  const d2 = orient(a.a, a.b, b.b);
-  const d3 = orient(b.a, b.b, a.a);
-  const d4 = orient(b.a, b.b, a.b);
-  return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
-}
-
-function emptyReport(): CleanReport {
-  return {
-    nodes: 0,
-    edges: 0,
-    components: 0,
-    crossingFreeComponents: 0,
-    groups: 0,
-    cardOverlaps: 0,
-    edgeCrossings: 0,
-    edgeCardHits: 0,
-    labelCardOverlaps: 0,
-    labelLabelOverlaps: 0,
-    labelEdgeHits: 0,
-  };
-}
-
-/**
- * Convenience function matching cleanLayout signature for drop-in replacement.
- */
-export function dagcolaCleanLayout(
-  inputNodes: AllCanvasNodeData[],
-  inputEdges: CanvasEdgeData[],
-  opts: CleanOptions = DEFAULT_CLEAN_OPTIONS
-): { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport } {
-  return dagcolaLayout(inputNodes, inputEdges, opts);
+function describe(
+  result: { report: CleanReport; nodes: AllCanvasNodeData[] },
+  area: number
+): string {
+  const r = result.report;
+  return (
+    `cross=${r.edgeCrossings} behind=${r.edgeCardHits} overlap=${r.cardOverlaps} ` +
+    `labelCard=${r.labelCardOverlaps} labelLabel=${r.labelLabelOverlaps} labelEdge=${r.labelEdgeHits} ` +
+    `area=${Math.round(area)}`
+  );
 }

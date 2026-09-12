@@ -74,11 +74,11 @@ export class CanvasCompactSettingTab extends PluginSettingTab {
       cls: "setting-item-description",
     });
 
-    containerEl.createEl("h3", { text: "DagCola layout (d3-dag + webcola, experimental)" });
+    containerEl.createEl("h3", { text: "DagCola layout (d3-dag + webcola)" });
 
     new Setting(containerEl)
       .setName("Enable DagCola layout")
-      .setDesc("Use d3-dag for layered layout + webcola for constraint-based refinement. More robust for complex graphs with cycles.")
+      .setDesc("Adds the DagCola commands and the file-menu action. Off means only the Clean layout engine is available.")
       .addToggle((tg) =>
         tg.setValue(this.plugin.settings.dagcolaEnabled).onChange(async (v) => {
           this.plugin.settings.dagcolaEnabled = v;
@@ -88,7 +88,7 @@ export class CanvasCompactSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Use webcola refinement")
-      .setDesc("Run webcola constraint solver after d3-dag layout. Guarantees no node overlaps, enforces flow direction, and respects group containers.")
+      .setDesc("After d3-dag places the cards, let webcola pull them in as tight as its constraints allow: no overlaps, connections pointing parent-to-child, and group cards kept together. A refinement is only kept when it is still overlap-free and more compact than the layered layout.")
       .addToggle((tg) =>
         tg.setValue(this.plugin.settings.dagcolaUseColaRefinement).onChange(async (v) => {
           this.plugin.settings.dagcolaUseColaRefinement = v;
@@ -98,10 +98,10 @@ export class CanvasCompactSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Exact crossing minimization threshold")
-      .setDesc("Component size below which to use exact (optimal) crossing minimization. Larger components use a fast heuristic.")
+      .setDesc("Clusters up to this many cards get the provably minimal crossing count; larger clusters use a fast heuristic. Exact minimisation is exponential, so the value is capped at 60.")
       .addSlider((s) =>
         s
-          .setLimits(10, 100, 5)
+          .setLimits(10, 60, 5)
           .setValue(this.plugin.settings.dagcolaExactDecrossThreshold)
           .setDynamicTooltip()
           .onChange(async (v) => {
@@ -111,7 +111,7 @@ export class CanvasCompactSettingTab extends PluginSettingTab {
       );
 
     containerEl.createEl("p", {
-      text: "DagCola combines d3-dag's optimal Sugiyama layering with webcola's constraint solver. Best for graphs with cycles, many labels, or group containers.",
+      text: "DagCola lays each cluster out with d3-dag's layered algorithm, then optionally tightens it with webcola's constraint solver, and finishes through the same packing, connection-routing and label-placement pipeline as Clean layout. Direction, spacing, padding and label spacing come from the Clean layout settings above.",
       cls: "setting-item-description",
     });
   }

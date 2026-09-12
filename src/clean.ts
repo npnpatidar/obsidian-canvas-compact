@@ -554,7 +554,14 @@ function placeSide(
 
 /* ───────────────────────────── component layout ─────────────────────── */
 
-function assignSidesByGeometry(
+/**
+ * Re-seat every connection's endpoints on the sides that face each other, given
+ * where the cards ended up. Exported so the DagCola engine starts its clusters
+ * from the same geometry-derived sides the Clean engine uses instead of reusing
+ * whatever sides the canvas happened to store (which were chosen for the old,
+ * pre-layout positions and otherwise skew the crossing count).
+ */
+export function assignSidesByGeometry(
   nodes: AllCanvasNodeData[],
   edges: CanvasEdgeData[],
   fixed?: Set<string>
@@ -1366,7 +1373,7 @@ function resolveOverlaps(nodes: AllCanvasNodeData[], gap: number, iterations = 2
   return out;
 }
 
-function computeGroupMembers(
+export function computeGroupMembers(
   nodes: AllCanvasNodeData[]
 ): Map<string, Set<string>> {
   const members = new Map<string, Set<string>>();
@@ -1381,6 +1388,11 @@ function computeGroupMembers(
     members.set(g.id, set);
   }
   return members;
+}
+
+/** Padding a group box is wrapped with around its members. */
+export function groupPadding(padding: number): number {
+  return Math.max(10, padding / 3);
 }
 
 function fitGroups(
@@ -1406,7 +1418,7 @@ function fitGroups(
       maxY = Math.max(maxY, m.y + m.height);
     }
     if (!Number.isFinite(minX)) return n;
-    const p = Math.max(10, padding / 3);
+    const p = groupPadding(padding);
     return {
       ...n,
       x: minX - p,
@@ -1419,42 +1431,63 @@ function fitGroups(
 
 /* ────────────────────────────── entry point ─────────────────────────── */
 
-function runLayout(
+/** One connected cluster, already positioned by a layout engine. */
+export interface LaidComponent {
+  nodes: AllCanvasNodeData[];
+  edges: CanvasEdgeData[];
+}
+
+/**
+ * Finish a layout whose per-cluster coordinates are already known: pack the
+ * clusters, route connections and labels clear of cards, re-wrap group
+ * containers, verify, and build the report.
+ *
+ * This is the shared tail of every engine — the Clean engine and the DagCola
+ * engine (d3-dag + webcola) both call it — so packing, connection routing,
+ * label placement, the cost-aware refinement pass and the reported numbers can
+ * never drift apart between engines. An engine only has to decide where each
+ * cluster's cards go.
+ */
+export function layoutComponents(
   inputNodes: AllCanvasNodeData[],
   inputEdges: CanvasEdgeData[],
+  components: AllCanvasNodeData[][],
+  laidComponents: LaidComponent[],
   opts: CleanOptions
 ): { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport } {
+  opts = { ...DEFAULT_CLEAN_OPTIONS, ...opts };
   const nodes = inputNodes;
   const groups = nodes.filter((n) => n.type === "group");
   const members = computeGroupMembers(nodes);
-
-  // Groups are containers, not layout subjects; they are wrapped around their
-  // members once everything else has been placed.
-  const layoutNodes = nodes.filter((n) => n.type !== "group");
-  const groupIds = new Set(groups.map((g) => g.id));
-  const layoutEdges = inputEdges.filter((e) => !groupIds.has(e.fromNode) && !groupIds.has(e.toNode));
-
-  const components = connectedComponents(layoutNodes, layoutEdges);
   const edgeById = new Map(inputEdges.map((e) => [e.id, e]));
+  for (const c of laidComponents) for (const e of c.edges) edgeById.set(e.id, e);
 
-  const laid: { nodes: AllCanvasNodeData[]; bbox: Rect }[] = [];
-
-  for (const comp of components) {
-    const ids = new Set(comp.map((n) => n.id));
-    const compEdges = layoutEdges.filter((e) => ids.has(e.fromNode) && ids.has(e.toNode));
-    const result = layoutComponent(comp, compEdges, opts);
-
-    for (const e of result.edges) edgeById.set(e.id, e);
-
-    const minX = Math.min(...result.nodes.map((n) => n.x));
-    const minY = Math.min(...result.nodes.map((n) => n.y));
-    const maxX = Math.max(...result.nodes.map((n) => n.x + n.width));
-    const maxY = Math.max(...result.nodes.map((n) => n.y + n.height));
-    laid.push({
-      nodes: result.nodes,
-      bbox: { x: minX, y: minY, width: maxX - minX, height: maxY - minY },
-    });
-  }
+  // Cluster bounding boxes are measured from the nodes themselves, so they stay
+  // correct for any engine and for mirrored/transposed coordinates. A cluster
+  // that owns group members also claims the padding those group boxes will be
+  // wrapped with, so a neighbouring cluster can never be packed inside a group
+  // box (which would silently make those cards part of the group).
+  const groupPad = groupPadding(opts.padding);
+  const memberIds = new Set<string>();
+  for (const set of members.values()) for (const id of set) memberIds.add(id);
+  const laid: { nodes: AllCanvasNodeData[]; bbox: Rect }[] = laidComponents.map((c) => {
+    const ns = c.nodes;
+    if (ns.length === 0) return { nodes: ns, bbox: { x: 0, y: 0, width: 0, height: 0 } };
+    const hold = ns.some((n) => memberIds.has(n.id)) ? groupPad : 0;
+    const minX = Math.min(...ns.map((n) => n.x));
+    const minY = Math.min(...ns.map((n) => n.y));
+    const maxX = Math.max(...ns.map((n) => n.x + n.width));
+    const maxY = Math.max(...ns.map((n) => n.y + n.height));
+    return {
+      nodes: ns,
+      bbox: {
+        x: minX - hold,
+        y: minY - hold,
+        width: maxX - minX + 2 * hold,
+        height: maxY - minY + 2 * hold,
+      },
+    };
+  });
 
   // Pack component bounding boxes so clusters do not touch.
   const packOpts: PackOptions = {
@@ -1550,9 +1583,34 @@ function runLayout(
   return { nodes: orderedNodes, edges: finalEdges, report };
 }
 
+/**
+ * Clean layout of one configuration: split into clusters, lay each cluster out
+ * with the BFS-spanning-tree engine, then hand the result to the shared tail.
+ */
+function runLayout(
+  inputNodes: AllCanvasNodeData[],
+  inputEdges: CanvasEdgeData[],
+  opts: CleanOptions
+): { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport } {
+  // Groups are containers, not layout subjects; they are wrapped around their
+  // members once everything else has been placed.
+  const groupIds = new Set(inputNodes.filter((n) => n.type === "group").map((g) => g.id));
+  const layoutNodes = inputNodes.filter((n) => n.type !== "group");
+  const layoutEdges = inputEdges.filter((e) => !groupIds.has(e.fromNode) && !groupIds.has(e.toNode));
+
+  const components = connectedComponents(layoutNodes, layoutEdges);
+  const laid: LaidComponent[] = components.map((comp) => {
+    const ids = new Set(comp.map((n) => n.id));
+    const compEdges = layoutEdges.filter((e) => ids.has(e.fromNode) && ids.has(e.toNode));
+    return layoutComponent(comp, compEdges, opts);
+  });
+
+  return layoutComponents(inputNodes, inputEdges, components, laid, opts);
+}
+
 const ALL_DIRECTIONS: CleanDirection[] = ["top-to-bottom", "left-to-right", "balanced"];
 
-function bboxArea(nodes: AllCanvasNodeData[]): number {
+export function bboxArea(nodes: AllCanvasNodeData[]): number {
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
@@ -1566,9 +1624,31 @@ function bboxArea(nodes: AllCanvasNodeData[]): number {
   return Number.isFinite(minX) ? (maxX - minX) * (maxY - minY) : 0;
 }
 
-function betterReport(a: CleanReport, aArea: number, b: CleanReport, bArea: number): boolean {
-  const ka = [a.edgeCardHits, a.edgeCrossings, a.cardOverlaps, a.labelCardOverlaps, a.labelEdgeHits, aArea];
-  const kb = [b.edgeCardHits, b.edgeCrossings, b.cardOverlaps, b.labelCardOverlaps, b.labelEdgeHits, bArea];
+/**
+ * Lexicographic comparison of two candidate layouts: hard guarantees first
+ * (cards behind connections, crossings, overlaps), then label clearance, then
+ * compactness. Shared by the Clean engine's orientation search and by the
+ * DagCola engine's layered-vs-refined selection.
+ */
+export function betterReport(a: CleanReport, aArea: number, b: CleanReport, bArea: number): boolean {
+  const ka = [
+    a.edgeCardHits,
+    a.edgeCrossings,
+    a.cardOverlaps,
+    a.labelCardOverlaps,
+    a.labelLabelOverlaps,
+    a.labelEdgeHits,
+    aArea,
+  ];
+  const kb = [
+    b.edgeCardHits,
+    b.edgeCrossings,
+    b.cardOverlaps,
+    b.labelCardOverlaps,
+    b.labelLabelOverlaps,
+    b.labelEdgeHits,
+    bArea,
+  ];
   for (let i = 0; i < ka.length; i++) {
     if (ka[i]! < kb[i]!) return true;
     if (ka[i]! > kb[i]!) return false;

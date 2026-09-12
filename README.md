@@ -8,21 +8,21 @@ Cleans up an Obsidian canvas layout — **no card or label overlaps, minimal con
 - **Deterministic** — no force simulation; a BFS spanning tree is placed with a layered contour
   algorithm that is provably crossing-free, then cycle-closing edges are routed by side choice and
   a bounded local search that only ever reduces crossings.
-- **DagCola layout (experimental)** — combines **d3-dag** (optimal Sugiyama layered layout with
-  exact crossing minimization) and **webcola** (constraint-based solver with hard guarantees
-  for no overlaps, flow direction, group containers, and label clearance). Best for complex
-  graphs with cycles, many labels, or group containers.
+- **DagCola layout** — combines **d3-dag** (Sugiyama layered layout with exact crossing
+  minimisation) and **webcola** (constraint solver), then finishes through the same packing,
+  connection-routing and label-placement pipeline as Clean layout. Handles left→right and
+  balanced mind-map directions, cyclic graphs, and cards of very uneven size.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `Clean layout — no overlaps, minimal crossings` | Lays out each cluster so no card or label overlaps and connections don't cross (zero crossings for trees/planar graphs); reports any residual |
-| `DagCola layout — d3-dag + webcola (experimental)` | Uses d3-dag for optimal layered layout + webcola constraint solver for hard guarantees on overlaps, flow, and groups |
+| `DagCola layout — d3-dag + webcola` | Layered layout from d3-dag, tightened by webcola's constraint solver; whichever comes out cleaner wins |
 
 Also adds file menu items on any `.canvas` file:
 - `Canvas Compact: Clean layout (no overlaps)`
-- `Canvas Compact: DagCola layout (d3-dag + webcola)`
+- `Canvas Compact: DagCola layout (d3-dag + webcola)` — shown when DagCola layout is enabled in settings
 
 ### Clean layout guarantees
 
@@ -35,18 +35,40 @@ side anchors, so a **non-planar** connection graph (e.g. five cards all connecte
 - lays out trees, forests and planar graphs with **zero** crossings, and minimises crossings otherwise;
 - reports whatever it could not remove in the notice, e.g. `residual: 2 connection crossings`.
 
-### DagCola layout guarantees (experimental)
+### DagCola layout guarantees
 
-In addition to the Clean layout guarantees, DagCola adds:
+DagCola keeps the Clean layout guarantees (no card/card overlap, no label overlaps, no connection
+hidden behind a card) and adds:
 
-- **Hard constraint satisfaction** — webcola's solver mathematically guarantees no node overlaps,
-  flow-direction separation (top→bottom or left→right), and group containment.
-- **Optimal crossing minimization** — d3-dag's exact decrossing (for components ≤30 nodes by default)
-  finds the true minimum crossings; larger components use a fast two-layer heuristic.
-- **Cycle handling** — d3-dag's longest-path layering automatically ignores back-edges, producing
-  clean layered layouts even for cyclic graphs.
-- **Label-aware spacing** — webcola's constraint system naturally handles label clearance without
-  requiring manual gap tuning.
+- **Optimal crossing minimisation** — d3-dag's exact decrossing finds the true minimum crossings for
+  clusters up to the configured threshold (default 30, capped at 60, because exact minimisation is
+  exponential); larger clusters use a fast two-layer heuristic.
+- **Cycle handling** — longest-path layering ignores back-edges, so cyclic graphs still get a clean
+  layered layout.
+- **Direction support** — top→bottom, left→right and balanced (mind map) are all layering
+  directions. Left→right transposes the layered result, with the node extents swapped first so the
+  lane spacing that guarantees separation is computed from the extent that ends up on that axis.
+- **Real constraints, not just heuristics** — webcola enforces the configured spacing as a hard
+  constraint: no card overlaps, connections pointing parent→child, and every group's cards kept
+  together. It is pinned to the layered structure produced by d3-dag (each rank stays on one line,
+  in the order the crossings were minimised for), so it can tighten spacing but never permute the
+  drawing and silently add crossings.
+
+### How the two libraries work together
+
+1. Cards are split into connected clusters (group containers are not laid out; they are wrapped
+   around their members afterwards).
+2. Each cluster is laid out by d3-dag, at two spacings — 1× and 1.5× the configured gap. Spacing is
+   searched because whether a connection can be routed clear of every card depends on how much room
+   there is: the tightest arrangement is not always the cleanest.
+3. Each of those layouts is also re-solved by webcola at the same spacing. This is where it earns
+   its place — d3-dag sizes a rank's band by the largest card in it, so a small card following a
+   tall one is held further away than its own extents require, and webcola reclaims that room.
+4. Every candidate goes through the identical packing, connection-routing and label-placement
+   pipeline, and the lexicographically cleanest result wins: fewest connections hidden behind a
+   card first, then fewest crossings, then label clearance, then the most compact. A webcola
+   refinement can therefore improve a canvas but never spoil one — when d3-dag's layered layout is
+   already the better answer, the refinement is simply not selected.
 
 ## Settings
 
@@ -56,10 +78,10 @@ In addition to the Clean layout guarantees, DagCola adds:
 - **Outer padding (px)**
 - **Reserve space for connection labels**
 
-### DagCola layout (experimental)
-- **Enable DagCola layout** — use the new engine
-- **Use webcola refinement** — run constraint solver after d3-dag layout (recommended)
-- **Exact crossing minimization threshold** — component size below which to use exact crossing minimization (default: 30)
+### DagCola layout
+- **Enable DagCola layout** — show the DagCola commands and file-menu action; off means only the Clean layout engine is available
+- **Use webcola refinement** — also solve each cluster with webcola's constraint solver, and keep it when it comes out cleaner (on by default)
+- **Exact crossing minimization threshold** — cluster size up to which crossing minimisation is exact (default 30, capped at 60)
 
 ## Install
 
