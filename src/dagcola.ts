@@ -212,26 +212,6 @@ function generateFlowConstraints(
 }
 
 /**
- * Generate non-overlap constraints for all node pairs.
- */
-function generateNonOverlapConstraints(nodes: ColaNode[], gap: number): any[] {
-  const constraints: any[] = [];
-  for (let i = 0; i < nodes.length; i++) {
-    for (let j = i + 1; j < nodes.length; j++) {
-      const a = nodes[i]!;
-      const b = nodes[j]!;
-      constraints.push({
-        type: "nonoverlap",
-        node1: a.id,
-        node2: b.id,
-        margin: gap,
-      });
-    }
-  }
-  return constraints;
-}
-
-/**
  * Run webcola constraint solver on a set of nodes and edges.
  * Returns refined positions satisfying all constraints.
  * NOTE: Currently experimental - may not satisfy all constraints reliably.
@@ -283,7 +263,6 @@ function runColaRefinement(
   // Build constraints
   const constraints: any[] = [
     ...generateFlowConstraints(colaNodes, colaLinks, opts.direction, opts.gap),
-    ...generateNonOverlapConstraints(colaNodes, opts.gap),
   ];
 
   // Create and configure cola layout
@@ -300,8 +279,8 @@ function runColaRefinement(
     .defaultNodeSize(Math.max(...regularNodes.map((n) => Math.max(n.width, n.height))));
 
   // Run layout
-  const iterations = Math.min(500, Math.max(100, nodes.length * 5));
-  cola.start(50, 100, iterations, 0, false, true);
+  const iterations = Math.min(50, Math.max(10, nodes.length));
+  cola.start(10, 30, iterations, 0, false, true);
 
   // Extract positions - convert from center to top-left
   const finalPositions = new Map<string, { x: number; y: number }>();

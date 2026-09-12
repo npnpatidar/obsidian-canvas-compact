@@ -1,6 +1,6 @@
 {
   "name": "canvas-compact",
-  "version": "2.0.3",
+  "version": "2.0.4",
   "description": "Obsidian plugin: resize canvas cards to fit content and pack layout to minimum area — edge-aware",
   "main": "main.js",
   "type": "module",
