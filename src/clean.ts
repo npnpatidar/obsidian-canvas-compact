@@ -2,6 +2,18 @@ import type { AllCanvasNodeData, CanvasEdgeData, NodeSide } from "./Canvas.d";
 import type { PackOptions } from "./pack";
 import { maxRectsPack } from "./pack";
 import { connectedComponents, pointForSide, segmentIntersectsRect } from "./graph";
+import {
+  graphConnect,
+  sugiyama,
+  layeringLongestPath,
+  decrossOpt,
+  decrossTwoLayer,
+  coordSimplex,
+  coordGreedy,
+  type GraphNode,
+  type GraphLink,
+  type LayoutResult,
+} from "d3-dag";
 
 /**
  * ─────────────────────────────────────────────────────────────────────────────
@@ -616,6 +628,122 @@ function reduceCrossings(
   return nodes;
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// d3-dag backed component layout
+// ──────────────────────────────────────────────────────────────────────────────
+
+interface DagNodeDatum {
+  id: string;
+  width: number;
+  height: number;
+  type?: string;
+  original: AllCanvasNodeData;
+}
+
+interface DagLinkDatum {
+  source: string;
+  target: string;
+  original: CanvasEdgeData;
+}
+
+type DagGraphNode = GraphNode<DagNodeDatum, DagLinkDatum>;
+
+type DagGraphLink = GraphLink<DagNodeDatum, DagLinkDatum>;
+
+/**
+ * Run d3-dag Sugiyama layout on a component.
+ * Returns positioned nodes with optimal crossing minimization.
+ */
+function runDagLayout(
+  compNodes: AllCanvasNodeData[],
+  compEdges: CanvasEdgeData[],
+  opts: CleanOptions
+): { nodes: AllCanvasNodeData[]; width: number; height: number } {
+  if (compNodes.length === 0) return { nodes: [], width: 0, height: 0 };
+  if (compNodes.length === 1) {
+    const n = compNodes[0]!;
+    return { nodes: [{ ...n, x: 0, y: 0 }], width: n.width, height: n.height };
+  }
+
+  const nodeDataMap = new Map<string, DagNodeDatum>();
+  for (const n of compNodes) {
+    nodeDataMap.set(n.id, {
+      id: n.id,
+      width: n.width,
+      height: n.height,
+      type: n.type,
+      original: n,
+    });
+  }
+
+  const linkData: DagLinkDatum[] = compEdges.map((e) => ({
+    source: e.fromNode,
+    target: e.toNode,
+    original: e,
+  }));
+
+  const builder = graphConnect()
+    .sourceId((d: DagLinkDatum) => d.source)
+    .targetId((d: DagLinkDatum) => d.target)
+    .nodeDatum((id: string) => nodeDataMap.get(id) ?? { id, width: 100, height: 50, original: {} as AllCanvasNodeData });
+
+  const graph = builder(linkData);
+
+  // Calculate gap with label space reservation (matching original logic)
+  let gap = opts.gap;
+  if (opts.reserveLabelSpace) {
+    const labels = compEdges.map((e) => labelText(e)).filter((l) => l.length > 0);
+    if (labels.length > 0) {
+      let maxLabelW = 0;
+      let maxLabelH = 0;
+      for (const l of labels) {
+        const lines = l.split("\n");
+        maxLabelW = Math.max(maxLabelW, Math.max(...lines.map((s) => s.length)) * 7 + 16);
+        maxLabelH = Math.max(maxLabelH, lines.length * 16 + 10);
+      }
+      gap = Math.min(400, Math.max(gap, maxLabelW + 24, maxLabelH + 24));
+    }
+  }
+
+  let layout = sugiyama()
+    .nodeSize((node: DagGraphNode): readonly [number, number] => [
+      node.data.width + gap,
+      node.data.height + gap,
+    ])
+    .gap([gap, gap])
+    .layering(layeringLongestPath())
+    .decross(compNodes.length <= 30 ? decrossOpt() : decrossTwoLayer())
+    .coord(compNodes.length <= 50 ? coordSimplex() : coordGreedy());
+
+  const result: LayoutResult = layout(graph);
+
+  const positioned: AllCanvasNodeData[] = compNodes.map((n) => {
+    const dagNode = [...graph.nodes()].find((dn) => dn.data.id === n.id);
+    if (!dagNode || dagNode.ux === undefined || dagNode.uy === undefined) {
+      return { ...n, x: 0, y: 0 };
+    }
+    return {
+      ...n,
+      x: dagNode.x - n.width / 2,
+      y: dagNode.y - n.height / 2,
+    };
+  });
+
+  const minX = Math.min(...positioned.map((n) => n.x));
+  const minY = Math.min(...positioned.map((n) => n.y));
+  const normalized = positioned.map((n) => ({
+    ...n,
+    x: n.x - minX,
+    y: n.y - minY,
+  }));
+
+  return {
+    nodes: normalized,
+    width: result.width,
+    height: result.height,
+  };
+}
+
 interface ComponentResult {
   nodes: AllCanvasNodeData[];
   edges: CanvasEdgeData[];
@@ -626,6 +754,9 @@ function layoutComponent(
   compEdges: CanvasEdgeData[],
   opts: CleanOptions
 ): ComponentResult {
+  if (compNodes.length === 0) {
+    return { nodes: [], edges: [] };
+  }
   if (compNodes.length === 1) {
     const n = compNodes[0]!;
     return {
@@ -634,88 +765,25 @@ function layoutComponent(
     };
   }
 
-  // Only top-to-bottom stacks rows; `balanced` is a horizontal mind-map with two
-  // columns of depth either side of the root.
-  const layoutVertical = opts.direction === "top-to-bottom";
+  // Use d3-dag for optimal layered layout with crossing minimization
+  const { nodes, width, height } = runDagLayout(compNodes, compEdges, opts);
 
-  // A label sits at the edge midpoint, so a component with labels needs enough
-  // layer spacing for the widest/tallest label to clear its own endpoint cards.
-  const labels = compEdges.map((e) => labelText(e)).filter((l) => l.length > 0);
-  let gap = opts.gap;
-  if (opts.reserveLabelSpace && labels.length > 0) {
-    let maxLabelW = 0;
-    let maxLabelH = 0;
-    for (const l of labels) {
-      const lines = l.split("\n");
-      maxLabelW = Math.max(maxLabelW, Math.max(...lines.map((s) => s.length)) * 7 + 16);
-      maxLabelH = Math.max(maxLabelH, lines.length * 16 + 10);
-    }
-    gap = Math.min(400, Math.max(gap, maxLabelW + 24, maxLabelH + 24));
-  }
-
-  const root = buildSpanningTree(compNodes, compEdges, layoutVertical);
-
-  let positions: Map<string, Pos>;
-  if (opts.direction === "balanced" && root.children.length > 1) {
-    // Split the root's children across both sides, greedily balancing extent.
-    const demand = (t: TNode): number => {
-      const self = crossSize(t.node, false);
-      if (t.children.length === 0) return self;
-      const kids = t.children.reduce((s, c) => s + demand(c), 0) + (t.children.length - 1) * gap;
-      return Math.max(self, kids);
-    };
-    const ordered = [...root.children].sort((a, b) => demand(b) - demand(a));
-    const right: TNode[] = [];
-    const left: TNode[] = [];
-    let rightLoad = 0;
-    let leftLoad = 0;
-    for (const c of ordered) {
-      const d = demand(c);
-      if (rightLoad <= leftLoad) {
-        right.push(c);
-        rightLoad += d + gap;
-      } else {
-        left.push(c);
-        leftLoad += d + gap;
-      }
-    }
-    positions = new Map<string, Pos>();
-    positions.set(root.id, { main: 0, cross: 0 });
-    const rightPos = placeSide(right, root.node, false, gap, false);
-    const leftPos = placeSide(left, root.node, false, gap, true);
-    for (const [id, p] of rightPos) positions.set(id, p);
-    for (const [id, p] of leftPos) positions.set(id, p);
-  } else {
-    positions = new Map<string, Pos>();
-    positions.set(root.id, { main: 0, cross: 0 });
-    const sidePos = placeSide(root.children, root.node, layoutVertical, gap, false);
-    for (const [id, p] of sidePos) positions.set(id, p);
-  }
-
-  // main/cross → x/y
-  const depthOf = new Map<string, number>();
-  const collectDepth = (t: TNode): void => {
-    depthOf.set(t.id, t.depth);
-    for (const c of t.children) collectDepth(c);
-  };
-  collectDepth(root);
-
-  let nodes: AllCanvasNodeData[] = compNodes.map((n) => {
-    const p = positions.get(n.id) ?? { main: 0, cross: 0 };
-    const x = layoutVertical ? p.cross : p.main;
-    const y = layoutVertical ? p.main : p.cross;
-    return { ...n, x, y } as AllCanvasNodeData;
-  });
-
-  // Normalise to (0,0).
-  const minX = Math.min(...nodes.map((n) => n.x));
-  const minY = Math.min(...nodes.map((n) => n.y));
-  nodes = nodes.map((n) => ({ ...n, x: n.x - minX, y: n.y - minY }) as AllCanvasNodeData);
-
+  // Assign edge sides based on geometry
   let edges = assignSidesByGeometry(nodes, compEdges);
+
+  // The d3-dag layout already minimizes crossings optimally (for small graphs)
+  // or with a good heuristic (for larger graphs).
+  // We can still run the local crossing reduction as a refinement.
   if (opts.reduceCrossings) {
-    nodes = reduceCrossings(nodes, edges, depthOf, layoutVertical, opts.gap, opts.maxPasses);
-    edges = assignSidesByGeometry(nodes, compEdges);
+    // Build depth map from d3-dag layering (approximate from y positions for TB)
+    const depthOf = new Map<string, number>();
+    for (const n of nodes) {
+      depthOf.set(n.id, Math.round(n.y / (opts.gap + 50)));
+    }
+    const layoutVertical = opts.direction === "top-to-bottom";
+    const refinedNodes = reduceCrossings(nodes, edges, depthOf, layoutVertical, opts.gap, opts.maxPasses);
+    edges = assignSidesByGeometry(refinedNodes, compEdges);
+    return { nodes: refinedNodes, edges };
   }
 
   return { nodes, edges };

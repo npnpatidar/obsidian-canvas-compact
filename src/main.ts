@@ -1,13 +1,18 @@
 import { Plugin, Notice, TFile, ItemView, Menu } from "obsidian";
 import type { CanvasData, CanvasView, Canvas } from "./Canvas.d";
 import { cleanLayout, describeCleanReport, DEFAULT_CLEAN_OPTIONS } from "./clean";
-import type { CleanOptions, CleanDirection } from "./clean";
+import { dagcolaLayout, dagcolaCleanLayout } from "./dagcola";
+import type { CleanOptions, CleanDirection, CleanReport } from "./clean";
 
 interface CanvasCompactSettings {
   cleanDirection: CleanDirection;
   cleanGap: number;
   cleanPadding: number;
   cleanReserveLabelSpace: boolean;
+  // dagcola (d3-dag + webcola) settings
+  dagcolaEnabled: boolean;
+  dagcolaUseColaRefinement: boolean;
+  dagcolaExactDecrossThreshold: number;
 }
 
 const DEFAULT_SETTINGS: CanvasCompactSettings = {
@@ -15,6 +20,9 @@ const DEFAULT_SETTINGS: CanvasCompactSettings = {
   cleanGap: 60,
   cleanPadding: 60,
   cleanReserveLabelSpace: true,
+  dagcolaEnabled: false,
+  dagcolaUseColaRefinement: true,
+  dagcolaExactDecrossThreshold: 30,
 };
 
 function isCanvasFile(f: TFile | null): boolean {
@@ -50,6 +58,12 @@ export default class CanvasCompactPlugin extends Plugin {
       checkCallback: this.withCanvas((canvas) => this.runClean(canvas)),
     });
 
+    this.addCommand({
+      id: "canvas-compact-dagcola-layout",
+      name: "DagCola layout — d3-dag + webcola (experimental)",
+      checkCallback: this.withCanvas((canvas) => this.runDagcola(canvas)),
+    });
+
     this.registerEvent(
       (this.app.workspace as unknown as { on: (ev: string, cb: (...args: unknown[]) => unknown) => { unload: () => void } }).on(
         "file-menu",
@@ -60,6 +74,12 @@ export default class CanvasCompactPlugin extends Plugin {
               .setTitle("Canvas Compact: Clean layout (no overlaps)")
               .setIcon("sparkles")
               .onClick(async () => { await this.cleanLayoutFile(file as TFile); })
+          );
+          (menu as Menu).addItem((item) =>
+            item
+              .setTitle("Canvas Compact: DagCola layout (d3-dag + webcola)")
+              .setIcon("sparkles")
+              .onClick(async () => { await this.dagcolaLayoutFile(file as TFile); })
           );
         }
       )
@@ -94,10 +114,32 @@ export default class CanvasCompactPlugin extends Plugin {
     };
   }
 
+  private dagcolaOptions() {
+    return {
+      gap: this.settings.cleanGap,
+      padding: this.settings.cleanPadding,
+      direction: this.settings.cleanDirection,
+      reserveLabelSpace: this.settings.cleanReserveLabelSpace,
+      reduceCrossings: true,
+      maxPasses: 40,
+      useColaRefinement: this.settings.dagcolaUseColaRefinement,
+      exactDecrossThreshold: this.settings.dagcolaExactDecrossThreshold,
+    };
+  }
+
   private async runClean(canvas: Canvas): Promise<void> {
     const data = canvas.getData() as CanvasData;
     if (data.nodes.length === 0) { new Notice("Canvas is empty."); return; }
     const { nodes, edges, report } = cleanLayout([...data.nodes], [...data.edges], this.cleanOptions());
+    canvas.setData({ ...data, nodes, edges });
+    canvas.requestSave(false);
+    new Notice(describeCleanReport(report));
+  }
+
+  private async runDagcola(canvas: Canvas): Promise<void> {
+    const data = canvas.getData() as CanvasData;
+    if (data.nodes.length === 0) { new Notice("Canvas is empty."); return; }
+    const { nodes, edges, report } = dagcolaLayout([...data.nodes], [...data.edges], this.dagcolaOptions());
     canvas.setData({ ...data, nodes, edges });
     canvas.requestSave(false);
     new Notice(describeCleanReport(report));
@@ -109,6 +151,19 @@ export default class CanvasCompactPlugin extends Plugin {
     let data: CanvasData;
     try { data = JSON.parse(raw) as CanvasData; } catch { new Notice("Invalid canvas file"); return; }
     const { nodes, edges, report } = cleanLayout([...data.nodes], [...data.edges], this.cleanOptions());
+    data.nodes = nodes;
+    data.edges = edges;
+    await this.app.vault.modify(file, JSON.stringify(data, null, 2));
+    const view = getActiveCanvasView(this.app);
+    if (view && view.file.path === file.path) { view.canvas.setData(data); view.canvas.requestSave(false); }
+    new Notice(describeCleanReport(report));
+  }
+
+  private async dagcolaLayoutFile(file: TFile): Promise<void> {
+    const raw = await this.app.vault.cachedRead(file);
+    let data: CanvasData;
+    try { data = JSON.parse(raw) as CanvasData; } catch { new Notice("Invalid canvas file"); return; }
+    const { nodes, edges, report } = dagcolaLayout([...data.nodes], [...data.edges], this.dagcolaOptions());
     data.nodes = nodes;
     data.edges = edges;
     await this.app.vault.modify(file, JSON.stringify(data, null, 2));

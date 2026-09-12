@@ -70,7 +70,48 @@ export class CanvasCompactSettingTab extends PluginSettingTab {
       );
 
     containerEl.createEl("p", {
-      text: "Tip: Use “Clean layout” when you want no overlaps and as few connection crossings as the graph allows — a non-planar canvas cannot be drawn with zero crossings, and any that remain are reported.",
+      text: "Tip: Use \"Clean layout\" when you want no overlaps and as few connection crossings as the graph allows — a non-planar canvas cannot be drawn with zero crossings, and any that remain are reported.",
+      cls: "setting-item-description",
+    });
+
+    containerEl.createEl("h3", { text: "DagCola layout (d3-dag + webcola, experimental)" });
+
+    new Setting(containerEl)
+      .setName("Enable DagCola layout")
+      .setDesc("Use d3-dag for layered layout + webcola for constraint-based refinement. More robust for complex graphs with cycles.")
+      .addToggle((tg) =>
+        tg.setValue(this.plugin.settings.dagcolaEnabled).onChange(async (v) => {
+          this.plugin.settings.dagcolaEnabled = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Use webcola refinement")
+      .setDesc("Run webcola constraint solver after d3-dag layout. Guarantees no node overlaps, enforces flow direction, and respects group containers.")
+      .addToggle((tg) =>
+        tg.setValue(this.plugin.settings.dagcolaUseColaRefinement).onChange(async (v) => {
+          this.plugin.settings.dagcolaUseColaRefinement = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Exact crossing minimization threshold")
+      .setDesc("Component size below which to use exact (optimal) crossing minimization. Larger components use a fast heuristic.")
+      .addSlider((s) =>
+        s
+          .setLimits(10, 100, 5)
+          .setValue(this.plugin.settings.dagcolaExactDecrossThreshold)
+          .setDynamicTooltip()
+          .onChange(async (v) => {
+            this.plugin.settings.dagcolaExactDecrossThreshold = v;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    containerEl.createEl("p", {
+      text: "DagCola combines d3-dag's optimal Sugiyama layering with webcola's constraint solver. Best for graphs with cycles, many labels, or group containers.",
       cls: "setting-item-description",
     });
   }
