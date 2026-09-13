@@ -1,21 +1,21 @@
 import type { AllCanvasNodeData } from "./Canvas.d";
 
-export type PackStrategy = "maxrects" | "masonry";
+export type PackStrategy = "maxrects";
 
 export interface PackOptions {
   strategy: PackStrategy;
   gap: number; // px between nodes
   padding: number; // outer padding of packed bbox
-  columns?: number; // masonry only; "auto" = infer from viewport
+
   sortBy: "input" | "areaDesc" | "heightDesc" | "widthDesc";
   binWidth?: number; // for maxrects; if omitted infer from widest row
 }
 
+/** Defaults kept for callers/tests; the engines pass explicit options. */
 export const DEFAULT_PACK_OPTIONS: PackOptions = {
   strategy: "maxrects",
   gap: 20,
   padding: 20,
-  columns: undefined, // auto
   sortBy: "heightDesc",
   binWidth: undefined,
 };
@@ -45,41 +45,6 @@ function bbox(nodes: AllCanvasNodeData[]): Rect {
   const maxX = Math.max(...nodes.map((n) => n.x + n.width));
   const maxY = Math.max(...nodes.map((n) => n.y + n.height));
   return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
-}
-
-// ── Masonry (order-preserving, column shortest-fit) ──
-export function masonryPack(nodes: AllCanvasNodeData[], opts: PackOptions): AllCanvasNodeData[] {
-  if (nodes.length === 0) return [];
-  const gap = opts.gap;
-  const pad = opts.padding;
-
-  // infer columns if auto: aim for ~4-6 columns, container ~1200px
-  let cols = opts.columns ?? 0;
-  if (!cols || cols < 1) {
-    const avgW = nodes.reduce((s, n) => s + n.width, 0) / nodes.length;
-    const estContainer = 1400; // target compact width
-    cols = Math.max(1, Math.min(nodes.length, Math.round(estContainer / (avgW + gap))));
-    cols = Math.min(cols, 6);
-  }
-
-  const colHeights = new Array<number>(cols).fill(pad);
-  const colX: number[] = [];
-  // compute x for each column using max width in that column slot? Use avg approx; adjust per node
-  // simpler: fixed stride = maxNodeWidth+gap
-  const maxW = Math.max(...nodes.map((n) => n.width));
-  for (let i = 0; i < cols; i++) colX.push(pad + i * (maxW + gap));
-
-  // For variable widths, recalc x per node as colX[col] (left-aligned), not justified
-  const out: AllCanvasNodeData[] = [];
-  for (const n of nodes) {
-    // shortest column
-    let col = 0;
-    let minH = colHeights[0]!;
-    for (let i = 1; i < cols; i++) if (colHeights[i]! < minH) { minH = colHeights[i]!; col = i; }
-    out.push({ ...n, x: colX[col]!, y: colHeights[col]! } as AllCanvasNodeData);
-    colHeights[col]! += n.height + gap;
-  }
-  return out;
 }
 
 // ── MaxRects BSSF (Best Short Side Fit) ──
@@ -140,6 +105,7 @@ function pruneFreeRects(rects: Rect[]): Rect[] {
   }
   return out;
 }
+
 
 export function maxRectsPack(nodes: AllCanvasNodeData[], opts: PackOptions): AllCanvasNodeData[] {
   if (nodes.length === 0) return [];
@@ -217,20 +183,4 @@ export function maxRectsPack(nodes: AllCanvasNodeData[], opts: PackOptions): All
     return { ...n, x: p.x, y: p.y } as AllCanvasNodeData;
   });
   return out;
-}
-
-// Unified entry
-export function packLayout(nodes: AllCanvasNodeData[], opts: PackOptions = DEFAULT_PACK_OPTIONS): AllCanvasNodeData[] {
-  if (opts.strategy === "masonry") return masonryPack(nodes, opts);
-  return maxRectsPack(nodes, opts);
-}
-
-// Stats helper for notices
-export function packingStats(before: AllCanvasNodeData[], after: AllCanvasNodeData[]): { before: Rect; after: Rect; areaBefore: number; areaAfter: number; savedPct: number } {
-  const b = bbox(before);
-  const a = bbox(after);
-  const areaBefore = b.width * b.height;
-  const areaAfter = a.width * a.height;
-  const savedPct = areaBefore > 0 ? Math.round((1 - areaAfter / areaBefore) * 100) : 0;
-  return { before: b, after: a, areaBefore, areaAfter, savedPct };
 }

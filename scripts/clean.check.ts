@@ -5,11 +5,12 @@
  * hard guarantees: no card overlaps, no connection-behind-card, no label overlaps.
  * Crossings are reported (zero expected for trees; minimised otherwise).
  *
- * Build + run:
- *   npx tsc scripts/clean.check.ts src/clean.ts src/pack.ts src/graph.ts \
- *     --outDir /tmp/clean-check --module commonjs --target es2020 \
- *     --moduleResolution node --skipLibCheck --esModuleInterop --strict false \
- *   && node /tmp/clean-check/scripts/clean.check.js
+ * Build + run (from the repo root):
+ *   ./scripts/run-checks.sh      # both harnesses
+ *   npm test                     # same thing
+ *
+ * The script compiles the engine modules to a temp dir with the flags the old
+ * inline instructions used; there is no Obsidian runtime involved.
  */
 import {
   cleanLayout,
@@ -192,6 +193,43 @@ const spanResult = cleanLayout(spanNodes as never[], spanEdges as never[], {
 });
 check(spanResult.report.edgeCardHits === 0, `spanning edge behind cards = ${spanResult.report.edgeCardHits} (expected 0)`);
 check(spanResult.report.labelCardOverlaps === 0, `spanning label behind cards = ${spanResult.report.labelCardOverlaps} (expected 0)`);
+
+/* ── scenario 7: Direction must actually change the layout ── */
+// Regression guard: the direction used to be a no-op because the engine always
+// laid out top-to-bottom and then searched every orientation for the smallest
+// area, so all three directions returned an identical layout.
+const dirSpan = (dir: string): { w: number; h: number } => {
+  const { nodes: out } = cleanLayout(tree as never[], treeEdges as never[], {
+    ...DEFAULT_CLEAN_OPTIONS,
+    direction: dir as (typeof DEFAULT_CLEAN_OPTIONS)["direction"],
+  });
+  const w = Math.max(...out.map((n) => n.x + n.width)) - Math.min(...out.map((n) => n.x));
+  const h = Math.max(...out.map((n) => n.y + n.height)) - Math.min(...out.map((n) => n.y));
+  return { w: Math.round(w), h: Math.round(h) };
+};
+const tb = dirSpan("top-to-bottom");
+const lr = dirSpan("left-to-right");
+const bal = dirSpan("balanced");
+// For this wide tree the breadth runs along x, so a vertical flow (top-to-bottom)
+// is wide and short, while a horizontal flow (left-to-right) is tall and narrow.
+check(tb.w > tb.h, `top-to-bottom spreads breadth horizontally (${tb.w}x${tb.h})`);
+check(lr.h > lr.w, `left-to-right spreads breadth vertically (${lr.w}x${lr.h})`);
+check(
+  tb.w !== lr.w || tb.h !== lr.h,
+  `top-to-bottom (${tb.w}x${tb.h}) differs from left-to-right (${lr.w}x${lr.h})`
+);
+check(
+  bal.w !== tb.w || bal.h !== tb.h,
+  `balanced (${bal.w}x${bal.h}) differs from top-to-bottom (${tb.w}x${tb.h})`
+);
+
+/* ── scenario 8: exact-crossing threshold is honoured by Clean too ── */
+const thresholdArgs = { ...DEFAULT_CLEAN_OPTIONS, exactDecrossThreshold: 5 } as typeof DEFAULT_CLEAN_OPTIONS;
+const thresholdResult = cleanLayout(tree as never[], treeEdges as never[], thresholdArgs);
+check(
+  verifyCleanLayout(thresholdResult.nodes, thresholdResult.edges).cardOverlaps === 0,
+  "exactDecrossThreshold=5 keeps Clean layout overlap-free"
+);
 
 console.log(`\n=== ${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`} ===`);
 process.exit(failures === 0 ? 0 : 1);

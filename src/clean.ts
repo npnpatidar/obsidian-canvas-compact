@@ -2,18 +2,8 @@ import type { AllCanvasNodeData, CanvasEdgeData, NodeSide } from "./Canvas.d";
 import type { PackOptions } from "./pack";
 import { maxRectsPack } from "./pack";
 import { connectedComponents, pointForSide, segmentIntersectsRect } from "./graph";
-import {
-  graphConnect,
-  sugiyama,
-  layeringLongestPath,
-  decrossOpt,
-  decrossTwoLayer,
-  coordSimplex,
-  coordGreedy,
-  type GraphNode,
-  type GraphLink,
-  type LayoutResult,
-} from "d3-dag";
+import { DEFAULT_EXACT_DECROSS, clusterGap, layoutClusterInDirection } from "./daglayout";
+export { DEFAULT_EXACT_DECROSS, MAX_EXACT_DECROSS, SIMPLEX_LIMIT } from "./daglayout";
 
 /**
  * ─────────────────────────────────────────────────────────────────────────────
@@ -32,10 +22,13 @@ import {
  * zero crossings, which is why this module reports residuals instead of
  * pretending they cannot happen.
  *
- * The engine is deliberately deterministic (no force simulation): a BFS
- * spanning tree is laid out with a layered contour algorithm that is provably
- * crossing-free, then the extra ("cycle-closing") edges are placed by side
- * choice and a bounded local search that only ever reduces crossings.
+ * The engine is deliberately deterministic (no force simulation). Each cluster
+ * is laid out with d3-dag's Sugiyama pipeline — longest-path layering (which
+ * ignores back-edges, so cycles are handled), crossing minimisation (exact for
+ * small clusters, a fast two-layer heuristic above the threshold), and
+ * coordinate assignment. Connection sides and labels are then routed by
+ * geometry, a bounded local search reduces any residual crossings, and a
+ * cost-aware hill climb pulls cards clear of connections and labels.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
@@ -57,6 +50,11 @@ export interface CleanOptions {
   reduceCrossings: boolean;
   /** Cap on local-search passes. */
   maxPasses: number;
+  /**
+   * Cluster size up to which crossing minimisation is exact (`decrossOpt` is
+   * exponential). Larger clusters fall back to the two-layer heuristic.
+   */
+  exactDecrossThreshold: number;
 }
 
 export const DEFAULT_CLEAN_OPTIONS: CleanOptions = {
@@ -66,6 +64,7 @@ export const DEFAULT_CLEAN_OPTIONS: CleanOptions = {
   reserveLabelSpace: true,
   reduceCrossings: true,
   maxPasses: 40,
+  exactDecrossThreshold: DEFAULT_EXACT_DECROSS,
 };
 
 export interface CleanReport {
@@ -340,218 +339,6 @@ export function verifyCleanLayout(
   };
 }
 
-/* ─────────────────────── layered contour tree layout ────────────────── */
-
-interface TNode {
-  id: string;
-  node: AllCanvasNodeData;
-  depth: number;
-  children: TNode[];
-}
-
-interface Extent {
-  top: number;
-  bottom: number;
-}
-type Contour = Map<number, Extent>;
-interface Pos {
-  main: number;
-  cross: number;
-}
-
-function mainSize(n: AllCanvasNodeData, vertical: boolean): number {
-  return vertical ? n.height : n.width;
-}
-function crossSize(n: AllCanvasNodeData, vertical: boolean): number {
-  return vertical ? n.width : n.height;
-}
-
-/** Build a rooted BFS tree spanning the whole (connected) component. */
-function buildSpanningTree(
-  comp: AllCanvasNodeData[],
-  compEdges: CanvasEdgeData[],
-  vertical: boolean
-): TNode {
-  const nodeMap = new Map(comp.map((n) => [n.id, n]));
-  const adj = new Map<string, string[]>();
-  const indeg = new Map<string, number>();
-  for (const n of comp) {
-    adj.set(n.id, []);
-    indeg.set(n.id, 0);
-  }
-  for (const e of compEdges) {
-    if (!adj.has(e.fromNode) || !adj.has(e.toNode) || e.fromNode === e.toNode) continue;
-    adj.get(e.fromNode)!.push(e.toNode);
-    adj.get(e.toNode)!.push(e.fromNode);
-    indeg.set(e.toNode, (indeg.get(e.toNode) ?? 0) + 1);
-  }
-
-  // Root: prefer a true source (no incoming edge), else the best-connected node.
-  const candidates = comp.filter((n) => (indeg.get(n.id) ?? 0) === 0);
-  const pick = (list: AllCanvasNodeData[]) =>
-    [...list].sort((a, b) => {
-      const da = adj.get(a.id)?.length ?? 0;
-      const db = adj.get(b.id)?.length ?? 0;
-      if (db !== da) return db - da;
-      if (a.y !== b.y) return a.y - b.y;
-      return a.x - b.x;
-    })[0]!;
-  const rootNode = candidates.length > 0 ? pick(candidates) : pick(comp);
-
-  const tnode = new Map<string, TNode>();
-  for (const n of comp) tnode.set(n.id, { id: n.id, node: n, depth: 0, children: [] });
-
-  const parent = new Map<string, string>();
-  const visited = new Set<string>([rootNode.id]);
-  const queue: string[] = [rootNode.id];
-  while (queue.length > 0) {
-    const u = queue.shift()!;
-    const neighbours = [...(adj.get(u) ?? [])];
-    // Keep the author's ordering along the cross axis when possible.
-    neighbours.sort((x, y) => {
-      const nx = nodeMap.get(x)!;
-      const ny = nodeMap.get(y)!;
-      const cx = vertical ? nx.x : nx.y;
-      const cy = vertical ? ny.x : ny.y;
-      return cx - cy;
-    });
-    for (const v of neighbours) {
-      if (visited.has(v)) continue;
-      visited.add(v);
-      parent.set(v, u);
-      tnode.get(u)!.children.push(tnode.get(v)!);
-      tnode.get(v)!.depth = tnode.get(u)!.depth + 1;
-      queue.push(v);
-    }
-  }
-  return tnode.get(rootNode.id)!;
-}
-
-function packContours(contours: Contour[], gap: number): { offsets: number[]; combined: Contour } {
-  const offsets: number[] = [];
-  const combined: Contour = new Map();
-  if (contours.length === 0) return { offsets, combined };
-
-  offsets.push(0);
-  for (const [d, ext] of contours[0]!) combined.set(d, { top: ext.top, bottom: ext.bottom });
-
-  for (let i = 1; i < contours.length; i++) {
-    const contour = contours[i]!;
-    let shift = 0;
-    for (const [d, ext] of contour) {
-      const prev = combined.get(d);
-      if (prev) {
-        const needed = prev.bottom + gap - ext.top;
-        if (needed > shift) shift = needed;
-      }
-    }
-    offsets.push(shift);
-    for (const [d, ext] of contour) {
-      const shifted = { top: ext.top + shift, bottom: ext.bottom + shift };
-      const existing = combined.get(d);
-      if (existing) {
-        existing.top = Math.min(existing.top, shifted.top);
-        existing.bottom = Math.max(existing.bottom, shifted.bottom);
-      } else combined.set(d, shifted);
-    }
-  }
-  return { offsets, combined };
-}
-
-/**
- * Lay out one side of a tree. Columns advance outward along the main axis; a
- * node's children are packed against a per-depth contour so sibling subtrees
- * interlock tightly without overlapping. Because every node of depth d shares
- * a disjoint main-axis band, and nodes at the same depth are separated on the
- * cross axis, the result contains no card overlaps — and, since edges only run
- * between adjacent depths in nested order, no crossings either.
- */
-function placeSide(
-  group: TNode[],
-  rootNode: AllCanvasNodeData,
-  vertical: boolean,
-  gap: number,
-  mirror: boolean
-): Map<string, Pos> {
-  const maxMainByDepth = new Map<number, number>();
-  maxMainByDepth.set(0, mainSize(rootNode, vertical));
-  const walk = (t: TNode): void => {
-    const cur = maxMainByDepth.get(t.depth) ?? 0;
-    maxMainByDepth.set(t.depth, Math.max(cur, mainSize(t.node, vertical)));
-    for (const c of t.children) walk(c);
-  };
-  for (const g of group) walk(g);
-
-  let maxDepth = 0;
-  for (const d of maxMainByDepth.keys()) maxDepth = Math.max(maxDepth, d);
-
-  const colMain = new Map<number, number>();
-  colMain.set(0, 0);
-  for (let d = 1; d <= maxDepth; d++) {
-    const prevMain = colMain.get(d - 1) ?? 0;
-    colMain.set(d, prevMain + (maxMainByDepth.get(d - 1) ?? 0) + gap);
-  }
-
-  // `place` returns the subtree's positions in the local frame where the node
-  // itself sits at cross = 0, plus the contour used to interlock it with siblings.
-  const place = (t: TNode): { contour: Contour; local: Map<string, Pos> } => {
-    const d = t.depth;
-    const ms = mainSize(t.node, vertical);
-    const cs = crossSize(t.node, vertical);
-    const band = maxMainByDepth.get(d) ?? ms;
-    const local = new Map<string, Pos>();
-    local.set(t.id, { main: (colMain.get(d) ?? 0) + (band - ms) / 2, cross: 0 });
-
-    const contour: Contour = new Map([[d, { top: 0, bottom: cs }]]);
-    if (t.children.length === 0) return { contour, local };
-
-    const subs = t.children.map((child) => place(child));
-    const { offsets, combined } = packContours(
-      subs.map((s) => s.contour),
-      gap
-    );
-    const last = t.children[t.children.length - 1]!;
-    const blockTop = offsets[0]!;
-    const blockBottom = offsets[offsets.length - 1]! + crossSize(last.node, vertical);
-    const shift = cs / 2 - (blockTop + blockBottom) / 2;
-
-    subs.forEach((s, i) => {
-      const off = offsets[i]! + shift;
-      for (const [id, pos] of s.local) local.set(id, { main: pos.main, cross: pos.cross + off });
-    });
-
-    for (const [depth, ext] of combined) {
-      const s = { top: ext.top + shift, bottom: ext.bottom + shift };
-      const existing = contour.get(depth);
-      if (existing) {
-        existing.top = Math.min(existing.top, s.top);
-        existing.bottom = Math.max(existing.bottom, s.bottom);
-      } else contour.set(depth, s);
-    }
-    return { contour, local };
-  };
-
-  const virtualRoot: TNode = { id: "\u0000root", node: rootNode, depth: 0, children: group };
-  const { local: out } = place(virtualRoot);
-  out.delete(virtualRoot.id);
-
-  if (mirror) {
-    const nodeById = new Map<string, AllCanvasNodeData>();
-    const collect = (t: TNode): void => {
-      nodeById.set(t.id, t.node);
-      for (const c of t.children) collect(c);
-    };
-    for (const g of group) collect(g);
-    const rootMain = mainSize(rootNode, vertical);
-    for (const [id, pos] of out) {
-      const n = nodeById.get(id);
-      if (!n) continue;
-      out.set(id, { main: rootMain - pos.main - mainSize(n, vertical), cross: pos.cross });
-    }
-  }
-  return out;
-}
-
 /* ───────────────────────────── component layout ─────────────────────── */
 
 /**
@@ -635,121 +422,6 @@ function reduceCrossings(
   return nodes;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// d3-dag backed component layout
-// ──────────────────────────────────────────────────────────────────────────────
-
-interface DagNodeDatum {
-  id: string;
-  width: number;
-  height: number;
-  type?: string;
-  original: AllCanvasNodeData;
-}
-
-interface DagLinkDatum {
-  source: string;
-  target: string;
-  original: CanvasEdgeData;
-}
-
-type DagGraphNode = GraphNode<DagNodeDatum, DagLinkDatum>;
-
-type DagGraphLink = GraphLink<DagNodeDatum, DagLinkDatum>;
-
-/**
- * Run d3-dag Sugiyama layout on a component.
- * Returns positioned nodes with optimal crossing minimization.
- */
-function runDagLayout(
-  compNodes: AllCanvasNodeData[],
-  compEdges: CanvasEdgeData[],
-  opts: CleanOptions
-): { nodes: AllCanvasNodeData[]; width: number; height: number } {
-  if (compNodes.length === 0) return { nodes: [], width: 0, height: 0 };
-  if (compNodes.length === 1) {
-    const n = compNodes[0]!;
-    return { nodes: [{ ...n, x: 0, y: 0 }], width: n.width, height: n.height };
-  }
-
-  const nodeDataMap = new Map<string, DagNodeDatum>();
-  for (const n of compNodes) {
-    nodeDataMap.set(n.id, {
-      id: n.id,
-      width: n.width,
-      height: n.height,
-      type: n.type,
-      original: n,
-    });
-  }
-
-  const linkData: DagLinkDatum[] = compEdges.map((e) => ({
-    source: e.fromNode,
-    target: e.toNode,
-    original: e,
-  }));
-
-  const builder = graphConnect()
-    .sourceId((d: DagLinkDatum) => d.source)
-    .targetId((d: DagLinkDatum) => d.target)
-    .nodeDatum((id: string) => nodeDataMap.get(id) ?? { id, width: 100, height: 50, original: {} as AllCanvasNodeData });
-
-  const graph = builder(linkData);
-
-  // Calculate gap with label space reservation (matching original logic)
-  let gap = opts.gap;
-  if (opts.reserveLabelSpace) {
-    const labels = compEdges.map((e) => labelText(e)).filter((l) => l.length > 0);
-    if (labels.length > 0) {
-      let maxLabelW = 0;
-      let maxLabelH = 0;
-      for (const l of labels) {
-        const lines = l.split("\n");
-        maxLabelW = Math.max(maxLabelW, Math.max(...lines.map((s) => s.length)) * 7 + 16);
-        maxLabelH = Math.max(maxLabelH, lines.length * 16 + 10);
-      }
-      gap = Math.min(400, Math.max(gap, maxLabelW + 24, maxLabelH + 24));
-    }
-  }
-
-  let layout = sugiyama()
-    .nodeSize((node: DagGraphNode): readonly [number, number] => [
-      node.data.width + gap,
-      node.data.height + gap,
-    ])
-    .gap([gap, gap])
-    .layering(layeringLongestPath())
-    .decross(compNodes.length <= 30 ? decrossOpt() : decrossTwoLayer())
-    .coord(compNodes.length <= 50 ? coordSimplex() : coordGreedy());
-
-  const result: LayoutResult = layout(graph);
-
-  const positioned: AllCanvasNodeData[] = compNodes.map((n) => {
-    const dagNode = [...graph.nodes()].find((dn) => dn.data.id === n.id);
-    if (!dagNode || dagNode.ux === undefined || dagNode.uy === undefined) {
-      return { ...n, x: 0, y: 0 };
-    }
-    return {
-      ...n,
-      x: dagNode.x - n.width / 2,
-      y: dagNode.y - n.height / 2,
-    };
-  });
-
-  const minX = Math.min(...positioned.map((n) => n.x));
-  const minY = Math.min(...positioned.map((n) => n.y));
-  const normalized = positioned.map((n) => ({
-    ...n,
-    x: n.x - minX,
-    y: n.y - minY,
-  }));
-
-  return {
-    nodes: normalized,
-    width: result.width,
-    height: result.height,
-  };
-}
 
 interface ComponentResult {
   nodes: AllCanvasNodeData[];
@@ -772,23 +444,28 @@ function layoutComponent(
     };
   }
 
-  // Use d3-dag for optimal layered layout with crossing minimization
-  const { nodes, width, height } = runDagLayout(compNodes, compEdges, opts);
+  // d3-dag Sugiyama layout in the requested direction (shared with DagCola).
+  const nodes = layoutClusterInDirection(
+    compNodes,
+    compEdges,
+    opts.direction,
+    opts.exactDecrossThreshold,
+    clusterGap(compEdges, opts)
+  );
 
   // Assign edge sides based on geometry
   let edges = assignSidesByGeometry(nodes, compEdges);
 
-  // The d3-dag layout already minimizes crossings optimally (for small graphs)
-  // or with a good heuristic (for larger graphs).
-  // We can still run the local crossing reduction as a refinement.
+  // The d3-dag layout already minimises crossings optimally (for small graphs)
+  // or with a good heuristic (for larger graphs). The local search runs on top
+  // as a refinement. Group cards into their actual depth columns from the
+  // geometry d3-dag produced, so it swaps cards within one rank and never mixes
+  // two ranks that merely share a similar coordinate.
   if (opts.reduceCrossings) {
-    // Build depth map from d3-dag layering (approximate from y positions for TB)
+    const vertical = opts.direction !== "left-to-right";
     const depthOf = new Map<string, number>();
-    for (const n of nodes) {
-      depthOf.set(n.id, Math.round(n.y / (opts.gap + 50)));
-    }
-    const layoutVertical = opts.direction === "top-to-bottom";
-    const refinedNodes = reduceCrossings(nodes, edges, depthOf, layoutVertical, opts.gap, opts.maxPasses);
+    for (const n of nodes) depthOf.set(n.id, vertical ? Math.round(n.y) : Math.round(n.x));
+    const refinedNodes = reduceCrossings(nodes, edges, depthOf, vertical, opts.gap, opts.maxPasses);
     edges = assignSidesByGeometry(refinedNodes, compEdges);
     return { nodes: refinedNodes, edges };
   }
@@ -1585,7 +1262,7 @@ export function layoutComponents(
 
 /**
  * Clean layout of one configuration: split into clusters, lay each cluster out
- * with the BFS-spanning-tree engine, then hand the result to the shared tail.
+ * with the d3-dag engine, then hand the result to the shared tail.
  */
 function runLayout(
   inputNodes: AllCanvasNodeData[],
@@ -1607,8 +1284,6 @@ function runLayout(
 
   return layoutComponents(inputNodes, inputEdges, components, laid, opts);
 }
-
-const ALL_DIRECTIONS: CleanDirection[] = ["top-to-bottom", "left-to-right", "balanced"];
 
 export function bboxArea(nodes: AllCanvasNodeData[]): number {
   let minX = Infinity;
@@ -1657,11 +1332,11 @@ export function betterReport(a: CleanReport, aArea: number, b: CleanReport, bAre
 }
 
 /**
- * Clean layout with automatic best-result selection. Because the cleanest
- * layout (fewest behind-card connections, then fewest crossings) depends on how
- * the graph is oriented and how much room it is given, this runs a bounded set
- * of orientations and spacing scales and returns the globally best one. More
- * expensive, but produces the best result regardless of the current settings.
+ * Clean layout with automatic spacing selection. Whether a connection can be
+ * routed clear of every card depends on how much room it is given, so this runs
+ * a bounded set of spacing scales in the requested direction and returns the
+ * cleanest one. The direction itself is a hard constraint: it is what the user
+ * asked for, and both engines apply it the same way.
  */
 export function cleanLayout(
   inputNodes: AllCanvasNodeData[],
@@ -1670,12 +1345,11 @@ export function cleanLayout(
 ): { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport } {
   opts = { ...DEFAULT_CLEAN_OPTIONS, ...opts };
 
-  const orientations = [opts.direction, ...ALL_DIRECTIONS.filter((d) => d !== opts.direction)];
-  // Fine sampler of clearance room so the true lexicographic optimum (fewest
-  // behind-card, then fewest crossings, then most compact) is found. Each trial
-  // is cheap, and the user asked for the best result regardless of time. Grid is
-  // coarsened for very large canvases to keep the run bounded.
   const numNodes = inputNodes.length;
+  // Fine sampler of spacing scales so the true lexicographic optimum (fewest
+  // behind-card, then fewest crossings, then most compact) is found. Each trial
+  // is cheap, and the user asked for the best result regardless of time. The
+  // grid is coarsened for very large canvases to keep the run bounded.
   const GAPS =
     numNodes > 80
       ? [60, 120, 180, 240, 300]
@@ -1686,19 +1360,17 @@ export function cleanLayout(
   let best: { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport } | null = null;
   let bestArea = 0;
 
-  for (const direction of orientations) {
-    for (const gap of GAPS) {
-      let result: { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport };
-      try {
-        result = runLayout(inputNodes, inputEdges, { ...opts, direction, gap });
-      } catch {
-        continue;
-      }
-      const area = bboxArea(result.nodes);
-      if (!best || betterReport(result.report, area, best.report, bestArea)) {
-        best = result;
-        bestArea = area;
-      }
+  for (const gap of GAPS) {
+    let result: { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport };
+    try {
+      result = runLayout(inputNodes, inputEdges, { ...opts, gap });
+    } catch {
+      continue;
+    }
+    const area = bboxArea(result.nodes);
+    if (!best || betterReport(result.report, area, best.report, bestArea)) {
+      best = result;
+      bestArea = area;
     }
   }
   return best ?? runLayout(inputNodes, inputEdges, opts);

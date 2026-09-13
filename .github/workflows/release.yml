@@ -1,0 +1,113 @@
+name: Release
+
+# Cut a release by pushing a version tag, e.g.:
+#   npm version 2.0.6 --no-git-tag-version
+#   git commit -am "chore: release 2.0.6"
+#   git tag v2.0.6 && git push origin main --tags
+#
+# The tag must match the version in package.json and manifest.json, and
+# versions.json must already contain an entry for it — the workflow fails
+# loudly instead of publishing an inconsistent release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish (e.g. v2.0.6)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run layout verification harnesses
+        run: npm test
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          # Prefer the tag that triggered us; fall back to package.json.
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          manifest=$(node -p "require('./manifest.json').version")
+          pkg=$(node -p "require('./package.json').version")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag manifest=$manifest package.json=$pkg"
+
+          if [ "$tag" != "v$manifest" ]; then
+            echo "::error::tag $tag does not match manifest.json version v$manifest"
+            exit 1
+          fi
+          if [ "$pkg" != "$manifest" ]; then
+            echo "::error::package.json ($pkg) and manifest.json ($manifest) disagree"
+            exit 1
+          fi
+          if [ "$(node -p "Object.keys(require('./versions.json')).includes('$manifest')")" != "true" ]; then
+            echo "::error::versions.json has no entry for $manifest"
+            exit 1
+          fi
+
+      - name: Build (production bundle)
+        run: npm run build
+
+      - name: Verify release artifacts
+        run: |
+          set -euo pipefail
+          for f in main.js manifest.json; do
+            test -f "$f" || { echo "::error::missing release artifact: $f"; exit 1; }
+          done
+          echo "main.js: $(wc -c < main.js) bytes"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          version="${{ steps.version.outputs.version }}"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists — uploading/refreshing assets."
+            gh release upload "$tag" main.js manifest.json --clobber
+          else
+            cat > /tmp/notes.md <<EOF
+          ## Canvas Compact $version
+
+          Built from commit \`$GITHUB_SHA\`.
+
+          ### Assets
+          - \`main.js\` — bundled plugin
+          - \`manifest.json\` — plugin manifest
+
+          ### Install
+          Copy both files to \`<vault>/.obsidian/plugins/canvas-compact/\`, then enable **Canvas Compact** in Settings → Community plugins.
+          EOF
+            gh release create "$tag" main.js manifest.json \
+              --title "$tag" \
+              --generate-notes \
+              --notes-file /tmp/notes.md
+          fi

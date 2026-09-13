@@ -69,6 +69,20 @@ export class CanvasCompactSettingTab extends PluginSettingTab {
         })
       );
 
+    new Setting(containerEl)
+      .setName("Exact crossing minimization threshold")
+      .setDesc("Clusters up to this many cards get the provably minimal crossing count; larger clusters use a fast heuristic. Applies to both Clean and DagCola layout. Exact minimisation is exponential, so the value is capped at 60.")
+      .addSlider((s) =>
+        s
+          .setLimits(10, 60, 5)
+          .setValue(this.plugin.settings.dagcolaExactDecrossThreshold)
+          .setDynamicTooltip()
+          .onChange(async (v) => {
+            this.plugin.settings.dagcolaExactDecrossThreshold = v;
+            await this.plugin.saveSettings();
+          })
+      );
+
     containerEl.createEl("p", {
       text: "Tip: Use \"Clean layout\" when you want no overlaps and as few connection crossings as the graph allows — a non-planar canvas cannot be drawn with zero crossings, and any that remain are reported.",
       cls: "setting-item-description",
@@ -96,22 +110,8 @@ export class CanvasCompactSettingTab extends PluginSettingTab {
         })
       );
 
-    new Setting(containerEl)
-      .setName("Exact crossing minimization threshold")
-      .setDesc("Clusters up to this many cards get the provably minimal crossing count; larger clusters use a fast heuristic. Exact minimisation is exponential, so the value is capped at 60.")
-      .addSlider((s) =>
-        s
-          .setLimits(10, 60, 5)
-          .setValue(this.plugin.settings.dagcolaExactDecrossThreshold)
-          .setDynamicTooltip()
-          .onChange(async (v) => {
-            this.plugin.settings.dagcolaExactDecrossThreshold = v;
-            await this.plugin.saveSettings();
-          })
-      );
-
     containerEl.createEl("p", {
-      text: "DagCola lays each cluster out with d3-dag's layered algorithm, then optionally tightens it with webcola's constraint solver, and finishes through the same packing, connection-routing and label-placement pipeline as Clean layout. Direction, spacing, padding and label spacing come from the Clean layout settings above.",
+      text: "DagCola lays each cluster out with d3-dag's layered algorithm, then optionally tightens it with webcola's constraint solver, and finishes through the same packing, connection-routing and label-placement pipeline as Clean layout. Direction, spacing, padding, label spacing and the crossing threshold come from the Clean layout settings above.",
       cls: "setting-item-description",
     });
   }

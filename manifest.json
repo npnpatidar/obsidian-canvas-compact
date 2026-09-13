@@ -1,9 +1,9 @@
 {
-  "author": "Sisyphus",
-  "description": "Clean layout for canvas — no card/label overlaps, minimal connection crossings.",
-  "id": "canvas-compact",
-  "isDesktopOnly": false,
-  "minAppVersion": "1.4.0",
-  "name": "Canvas Compact",
-  "version": "2.0.5"
+	"author": "Sisyphus",
+	"description": "Clean layout for canvas — no card/label overlaps, minimal connection crossings.",
+	"id": "canvas-compact",
+	"isDesktopOnly": false,
+	"minAppVersion": "1.4.0",
+	"name": "Canvas Compact",
+	"version": "2.0.6"
 }

@@ -7,11 +7,12 @@
  * Also exercises colaRefine() directly, since that is where the constraint
  * indices and the compaction have to be right.
  *
- * Build + run:
- *   npx tsc scripts/dagcola.check.ts src/dagcola.ts src/clean.ts src/pack.ts src/graph.ts \
- *     --outDir /tmp/dagcola-check --module commonjs --target es2020 \
- *     --moduleResolution node --skipLibCheck --esModuleInterop --strict false \
- *   && NODE_PATH="$PWD/node_modules" node /tmp/dagcola-check/scripts/dagcola.check.js
+ * Build + run (from the repo root):
+ *   ./scripts/run-checks.sh      # both harnesses
+ *   npm test                     # same thing
+ *
+ * The script compiles the engine modules to a temp dir with the flags the old
+ * inline instructions used; there is no Obsidian runtime involved.
  */
 import {
   dagcolaLayout,

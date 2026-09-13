@@ -9,10 +9,12 @@ interface CanvasCompactSettings {
   cleanGap: number;
   cleanPadding: number;
   cleanReserveLabelSpace: boolean;
+  // The crossing threshold applies to both engines; the key keeps its historic
+  // `dagcola` prefix so existing saved settings keep loading.
+  dagcolaExactDecrossThreshold: number;
   // dagcola (d3-dag + webcola) settings
   dagcolaEnabled: boolean;
   dagcolaUseColaRefinement: boolean;
-  dagcolaExactDecrossThreshold: number;
 }
 
 const DEFAULT_SETTINGS: CanvasCompactSettings = {
@@ -131,6 +133,7 @@ export default class CanvasCompactPlugin extends Plugin {
       padding: this.settings.cleanPadding,
       direction: this.settings.cleanDirection,
       reserveLabelSpace: this.settings.cleanReserveLabelSpace,
+      exactDecrossThreshold: this.settings.dagcolaExactDecrossThreshold,
     };
   }
 

@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run layout verification harnesses
+        run: npm test
+
+      - name: Build (production bundle)
+        run: npm run build
+
+      - name: Verify release artifacts
+        run: |
+          set -euo pipefail
+          for f in main.js manifest.json; do
+            test -f "$f" || { echo "::error::missing release artifact: $f"; exit 1; }
+          done
+          echo "main.js: $(wc -c < main.js) bytes"
+
+      - name: Verify version consistency
+        run: |
+          set -euo pipefail
+          pkg=$(node -p "require('./package.json').version")
+          manifest=$(node -p "require('./manifest.json').version")
+          echo "package.json=$pkg manifest.json=$manifest"
+          if [ "$pkg" != "$manifest" ]; then
+            echo "::error::version mismatch — package.json=$pkg manifest.json=$manifest"
+            exit 1
+          fi
+          if [ "$(node -p "Object.keys(require('./versions.json')).includes('$pkg')")" != "true" ]; then
+            echo "::error::versions.json has no entry for $pkg"
+            exit 1
+          fi
+
+      - name: Upload built bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: canvas-compact-bundle
+          path: |
+            main.js
+            manifest.json
+          if-no-files-found: error
