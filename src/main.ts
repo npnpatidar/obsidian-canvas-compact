@@ -15,6 +15,8 @@ interface CanvasCompactSettings {
   // dagcola (d3-dag + webcola) settings
   dagcolaEnabled: boolean;
   dagcolaUseColaRefinement: boolean;
+  // Emit layout-engine diagnostics to the developer console.
+  debug: boolean;
 }
 
 const DEFAULT_SETTINGS: CanvasCompactSettings = {
@@ -25,6 +27,7 @@ const DEFAULT_SETTINGS: CanvasCompactSettings = {
   dagcolaEnabled: false,
   dagcolaUseColaRefinement: true,
   dagcolaExactDecrossThreshold: DEFAULT_EXACT_DECROSS,
+  debug: false,
 };
 
 function isCanvasFile(f: TFile | null): boolean {
@@ -43,6 +46,13 @@ function getActiveCanvasView(app: Plugin["app"]): CanvasView | null {
   }
   const anyLeaf = app.workspace.getLeavesOfType("canvas")[0];
   if (anyLeaf) return (anyLeaf.view as unknown as CanvasView) ?? null;
+  // The active file is a canvas but no matching view was reachable — either
+  // Obsidian's internal API shifted or the view has not loaded yet. Surface it
+  // loudly so an API break is diagnosed instead of silently failing the command.
+  const active = app.workspace.getActiveFile();
+  if (active && active.extension === "canvas" && app.workspace.getLeavesOfType("canvas").length > 0) {
+    console.warn("[canvas-compact] active file is a canvas but no matching canvas view was found — the Obsidian Canvas API may have changed");
+  }
   return null;
 }
 
@@ -134,6 +144,7 @@ export default class CanvasCompactPlugin extends Plugin {
       direction: this.settings.cleanDirection,
       reserveLabelSpace: this.settings.cleanReserveLabelSpace,
       exactDecrossThreshold: this.settings.dagcolaExactDecrossThreshold,
+      debug: this.settings.debug,
     };
   }
 
@@ -145,6 +156,7 @@ export default class CanvasCompactPlugin extends Plugin {
       reserveLabelSpace: this.settings.cleanReserveLabelSpace,
       useColaRefinement: this.settings.dagcolaUseColaRefinement,
       exactDecrossThreshold: this.settings.dagcolaExactDecrossThreshold,
+      debug: this.settings.debug,
     };
   }
 

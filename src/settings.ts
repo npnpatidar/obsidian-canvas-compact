@@ -114,5 +114,17 @@ export class CanvasCompactSettingTab extends PluginSettingTab {
       text: "DagCola lays each cluster out with d3-dag's layered algorithm, then optionally tightens it with webcola's constraint solver, and finishes through the same packing, connection-routing and label-placement pipeline as Clean layout. Direction, spacing, padding, label spacing and the crossing threshold come from the Clean layout settings above.",
       cls: "setting-item-description",
     });
+
+    containerEl.createEl("h3", { text: "Diagnostics" });
+
+    new Setting(containerEl)
+      .setName("Debug logging")
+      .setDesc("Emit per-pass layout-engine diagnostics to the developer console (Cmd/Ctrl+Shift+I). Helps diagnose layout issues; leave off for normal use.")
+      .addToggle((tg) =>
+        tg.setValue(this.plugin.settings.debug).onChange(async (v) => {
+          this.plugin.settings.debug = v;
+          await this.plugin.saveSettings();
+        })
+      );
   }
 }
