@@ -17,7 +17,9 @@ import {
   verifyCleanLayout,
   describeCleanReport,
   DEFAULT_CLEAN_OPTIONS,
+  COST_WEIGHTS,
 } from "../src/clean";
+import { LayoutEngineError } from "../src/daglayout";
 
 type AnyNode = Record<string, unknown>;
 type AnyEdge = Record<string, unknown>;
@@ -187,6 +189,65 @@ const treeReport = cleanLayout(tree as never[], treeEdges as never[], {
 }).report;
 check(treeReport.edgeCrossings === 0, `tree crossings = ${treeReport.edgeCrossings} (expected 0)`);
 
+/* ── balanced fallback must be reported, not silent ── */
+// A cycle has no single root, so balanced cannot build wings and must fall back
+// to layered. The reason has to surface in the report, or the user is silently
+// handed a different orientation than the one they asked for.
+const cycleBalanced = cleanLayout(cycle as never[], cycleEdges as never[], {
+  ...DEFAULT_CLEAN_OPTIONS,
+  direction: "balanced",
+});
+check(
+  Array.isArray(cycleBalanced.report.notes) && cycleBalanced.report.notes.length > 0,
+  "balanced fallback on a cyclic graph surfaces a report note"
+);
+if (cycleBalanced.report.notes?.length) {
+  console.log(`  · note: ${cycleBalanced.report.notes.join("; ")}`);
+}
+const fallbackNote = describeCleanReport(cycleBalanced.report);
+check(
+  fallbackNote.includes("layered"),
+  `describeCleanReport explains the fallback ("${fallbackNote}")`
+);
+
+/* ── engine failures are wrapped, not swallowed ── */
+// A real layout-engine failure must surface as a specific error (so main.ts's
+// guarded() can tell the user) instead of being mistaken for a spacing trial
+// that simply did not fit. d3-dag is defensive against most malformed input,
+// so this asserts the error-boundary contract directly.
+const engineErr = new LayoutEngineError("boom");
+check(engineErr instanceof Error, "LayoutEngineError is an Error");
+check(engineErr.name === "LayoutEngineError", "LayoutEngineError carries its name");
+
+/* ── cost-weight priority hierarchy ──
+ * The global cost tiers must dominate the sum of all lower tiers, or a fix to a
+ * high-priority problem could be traded away for several low-priority wins. This
+ * asserts that invariant so a future weight change cannot silently invert it.
+ */
+{
+  const tiers = [
+    COST_WEIGHTS.cardOverlap,
+    COST_WEIGHTS.edgeBehindCard,
+    COST_WEIGHTS.labelOverCard,
+    COST_WEIGHTS.labelOnEdge,
+    COST_WEIGHTS.edgeCrossing,
+  ];
+  for (let i = 0; i < tiers.length; i++) {
+    const lowerSum = tiers.slice(i + 1).reduce((a, b) => a + b, 0);
+    check(
+      tiers[i]! > lowerSum,
+      `cost tier ${i} (${tiers[i]}) dominates the sum of lower tiers (${lowerSum})`
+    );
+  }
+  // The per-unit tie-breakers must stay below the cheapest discrete tier so a
+  // single unit of displacement/sprawl can never outrank a real defect.
+  check(
+    COST_WEIGHTS.displacementPerUnit < COST_WEIGHTS.edgeCrossing &&
+      COST_WEIGHTS.sprawlPerUnit < COST_WEIGHTS.edgeCrossing,
+    "per-unit tie-breakers stay below the cheapest discrete tier"
+  );
+}
+
 const spanResult = cleanLayout(spanNodes as never[], spanEdges as never[], {
   ...DEFAULT_CLEAN_OPTIONS,
   direction: "top-to-bottom",
@@ -230,6 +291,39 @@ check(
   verifyCleanLayout(thresholdResult.nodes, thresholdResult.edges).cardOverlaps === 0,
   "exactDecrossThreshold=5 keeps Clean layout overlap-free"
 );
+
+/* ── large-canvas regression guard ──
+ * The refinement pass used to scan O(edges × cards) geometry per pass; with a
+ * spatial grid it is O(edges × cards-per-cell). This builds a 120-node DAG so
+ * the grid path is exercised end-to-end and asserts it stays valid and completes
+ * in reasonable time (a generous budget keeps CI stable; a pathological blowup
+ * fails it).
+ */
+{
+  const big: AnyNode[] = [];
+  const bigEdges: AnyEdge[] = [];
+  const ROWS = 10, COLS = 12; // 120 cards in a grid, connected down/right
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      big.push(node(`n${r}_${c}`, c * 260, r * 160, 200 + (r + c) % 3 * 40, 120));
+    }
+  }
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const id = `n${r}_${c}`;
+      if (r + 1 < ROWS) bigEdges.push(edge(`v${id}`, id, `n${r + 1}_${c}`));
+      if (c + 1 < COLS) bigEdges.push(edge(`h${id}`, id, `n${r}_${c + 1}`));
+    }
+  }
+  const t0 = Date.now();
+  const bigResult = cleanLayout(big as never[], bigEdges as never[], DEFAULT_CLEAN_OPTIONS);
+  const bigMs = Date.now() - t0;
+  console.log(`  large canvas: ${big.length} cards, ${bigEdges.length} edges in ${bigMs}ms`);
+  check(bigResult.nodes.length === big.length, "large canvas preserves node count");
+  check(bigResult.report.cardOverlaps === 0, "large canvas has no card overlaps");
+  check(bigResult.report.edgeCardHits === 0, "large canvas has no connections behind cards");
+  check(bigMs < 5000, `large canvas completes in reasonable time (${bigMs}ms < 5000ms)`);
+}
 
 console.log(`\n=== ${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`} ===`);
 process.exit(failures === 0 ? 0 : 1);

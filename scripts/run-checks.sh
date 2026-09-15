@@ -17,7 +17,7 @@ build() {
   npx tsc "$entry" src/clean.ts src/dagcola.ts src/daglayout.ts src/pack.ts src/graph.ts src/Canvas.d.ts \
     --outDir "$OUT/$name" \
     --module commonjs --target es2020 --moduleResolution node \
-    --skipLibCheck --esModuleInterop --strict false
+    --skipLibCheck --esModuleInterop --strict
 }
 
 echo "▸ building harnesses"
