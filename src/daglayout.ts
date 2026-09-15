@@ -31,6 +31,20 @@ export const MAX_EXACT_DECROSS = 60;
 /** Above this, coordinate assignment falls back to the fast heuristic. */
 export const SIMPLEX_LIMIT = 120;
 
+/**
+ * A layout-engine failure that is not a spacing-trial that simply did not work
+ * — a real bug in the input graph (malformed edges, missing nodes) or in d3-dag
+ * itself. `cleanLayout` rethrows this instead of swallowing it, so a genuine
+ * failure surfaces to the user as a specific error rather than being silently
+ * treated as "that gap just didn't fit".
+ */
+export class LayoutEngineError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LayoutEngineError";
+  }
+}
+
 interface DagNodeDatum {
   id: string;
   width: number;
@@ -47,8 +61,7 @@ interface DagLinkDatum {
 type DagGraphNode = GraphNode<DagNodeDatum, DagLinkDatum>;
 
 function labelText(edge: CanvasEdgeData): string {
-  const label = (edge as { label?: unknown }).label;
-  return typeof label === "string" ? label : "";
+  return typeof edge.label === "string" ? edge.label : "";
 }
 
 /** Shift a cluster so its bounding box starts at the origin. */
@@ -121,12 +134,18 @@ export function layeredCluster(
     leftToRight ? [node.data.height, node.data.width] : [node.data.width, node.data.height];
 
   const exact = compNodes.length <= exactDecross;
-  sugiyama()
-    .nodeSize(sizeOf)
-    .gap([gap, gap])
-    .layering(layeringLongestPath())
-    .decross(exact ? decrossOpt() : decrossTwoLayer())
-    .coord(compNodes.length <= SIMPLEX_LIMIT ? coordSimplex() : coordGreedy())(graph);
+  try {
+    sugiyama()
+      .nodeSize(sizeOf)
+      .gap([gap, gap])
+      .layering(layeringLongestPath())
+      .decross(exact ? decrossOpt() : decrossTwoLayer())
+      .coord(compNodes.length <= SIMPLEX_LIMIT ? coordSimplex() : coordGreedy())(graph);
+  } catch (err) {
+    throw new LayoutEngineError(
+      `d3-dag layering failed on ${compNodes.length} nodes in ${direction} direction: ${(err as Error).message}`
+    );
+  }
 
   // d3-dag stores the assigned centre in `ux`/`uy`; `x`/`y` throw while unset.
   const positioned = new Map<string, DagGraphNode>();
@@ -153,27 +172,42 @@ export function layeredCluster(
  * out independently as a layered cluster, mirror one of them, and stand them
  * side by side with the root centred above. The wings occupy disjoint x ranges
  * and sit entirely below the root, so the result cannot self-overlap.
+ *
+ * Balanced is only meaningful for a single-rooted tree: when the graph is not
+ * one (too few nodes, no single root, one branch, or branches that do not split
+ * cleanly into two wings), it falls back to a layered layout and reports *why*,
+ * so the caller can surface the reason instead of silently changing the
+ * orientation the user asked for.
  */
+export interface BalancedResult {
+  nodes: AllCanvasNodeData[];
+  /** Non-empty only when the mind-map layout fell back to layered. */
+  reason?: "too-small" | "no-root" | "single-branch" | "not-tree" | "empty-wing";
+}
+
 export function balancedCluster(
   compNodes: AllCanvasNodeData[],
   compEdges: CanvasEdgeData[],
   exactDecross: number,
   gap: number
-): AllCanvasNodeData[] {
-  const fallback = () => layeredCluster(compNodes, compEdges, "top-to-bottom", exactDecross, gap);
-  if (compNodes.length <= 2) return fallback();
+): BalancedResult {
+  const fallback = (reason: NonNullable<BalancedResult["reason"]>): BalancedResult => ({
+    nodes: layeredCluster(compNodes, compEdges, "top-to-bottom", exactDecross, gap),
+    reason,
+  });
+  if (compNodes.length <= 2) return fallback("too-small");
 
   const childrenOf = (id: string): string[] =>
     compEdges.filter((e) => e.fromNode === id && e.toNode !== id).map((e) => e.toNode);
 
   const root = compNodes.find((n) => !compEdges.some((e) => e.toNode === n.id && e.fromNode !== n.id));
-  if (!root) return fallback();
+  if (!root) return fallback("no-root");
 
   const ordered = [...new Set(childrenOf(root.id))]
     .map((id) => compNodes.find((n) => n.id === id))
     .filter((n): n is AllCanvasNodeData => !!n)
     .sort((a, b) => a.x - b.x || a.y - b.y);
-  if (ordered.length < 2) return fallback();
+  if (ordered.length < 2) return fallback("single-branch");
 
   // Walk out from each wing's branches; every other card must be reachable from
   // exactly one of them or the graph is not a single-rooted tree and the plain
@@ -191,7 +225,7 @@ export function balancedCluster(
   const half = Math.ceil(ordered.length / 2);
   assign(ordered.slice(0, half).map((n) => n.id), "right");
   assign(ordered.slice(half).map((n) => n.id), "left");
-  if (sideOf.size !== compNodes.length - 1) return fallback();
+  if (sideOf.size !== compNodes.length - 1) return fallback("not-tree");
 
   const wing = (side: "left" | "right"): AllCanvasNodeData[] => {
     const nodes = compNodes.filter((n) => sideOf.get(n.id) === side);
@@ -206,7 +240,7 @@ export function balancedCluster(
   };
   const right = wing("right");
   const left = wing("left");
-  if (left.length === 0 || right.length === 0) return fallback();
+  if (left.length === 0 || right.length === 0) return fallback("empty-wing");
 
   const leftSpan = Math.max(...left.map((n) => n.x + n.width));
   const mirrored = left.map((n) => ({ ...n, x: leftSpan - n.x - n.width }));
@@ -218,22 +252,46 @@ export function balancedCluster(
   const rootX = Math.max(leftWidth, rightWidth) + rowGap;
   const leftX = rootX - rowGap - leftWidth;
 
-  return normalise([
-    { ...root, x: rootX, y: 0 } as AllCanvasNodeData,
-    ...mirrored.map((n) => ({ ...n, x: n.x + leftX, y: n.y + wingY }) as AllCanvasNodeData),
-    ...right.map((n) => ({ ...n, x: n.x + rootX + root.width + rowGap, y: n.y + wingY }) as AllCanvasNodeData),
-  ]);
+  return {
+    nodes: normalise([
+      { ...root, x: rootX, y: 0 } as AllCanvasNodeData,
+      ...mirrored.map((n) => ({ ...n, x: n.x + leftX, y: n.y + wingY }) as AllCanvasNodeData),
+      ...right.map((n) => ({ ...n, x: n.x + rootX + root.width + rowGap, y: n.y + wingY }) as AllCanvasNodeData),
+    ]),
+  };
 }
 
-/** Lay out one cluster in the requested direction. */
+/**
+ * Lay out one cluster in the requested direction.
+ *
+ * Returns the positioned nodes plus any layout notes (currently only a
+ * balanced fallback reason), so the caller can surface them in the report.
+ */
 export function layoutClusterInDirection(
   comp: AllCanvasNodeData[],
   compEdges: CanvasEdgeData[],
   direction: CleanDirection,
   exactDecross: number,
   gap: number
-): AllCanvasNodeData[] {
-  return direction === "balanced"
-    ? balancedCluster(comp, compEdges, exactDecross, gap)
-    : layeredCluster(comp, compEdges, direction, exactDecross, gap);
+): { nodes: AllCanvasNodeData[]; notes: string[] } {
+  if (direction === "balanced") {
+    const result = balancedCluster(comp, compEdges, exactDecross, gap);
+    return {
+      nodes: result.nodes,
+      notes: result.reason ? [fallbackReasonText(result.reason)] : [],
+    };
+  }
+  return { nodes: layeredCluster(comp, compEdges, direction, exactDecross, gap), notes: [] };
+}
+
+const FALLBACK_REASONS: Record<NonNullable<BalancedResult["reason"]>, string> = {
+  "too-small": "balanced: fewer than 3 cards — used layered layout",
+  "no-root": "balanced: no single root card — used layered layout",
+  "single-branch": "balanced: root has fewer than 2 branches — used layered layout",
+  "not-tree": "balanced: graph is not a single-rooted tree — used layered layout",
+  "empty-wing": "balanced: one side has no cards — used layered layout",
+};
+
+function fallbackReasonText(reason: NonNullable<BalancedResult["reason"]>): string {
+  return FALLBACK_REASONS[reason];
 }

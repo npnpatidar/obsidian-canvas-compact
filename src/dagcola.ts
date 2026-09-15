@@ -475,14 +475,14 @@ export function dagcolaLayout(
   const clustered = (comp: AllCanvasNodeData[], opts: CleanOptions): LaidComponent => {
     const ids = new Set(comp.map((n) => n.id));
     const compEdges = layoutEdges.filter((e) => ids.has(e.fromNode) && ids.has(e.toNode));
-    const nodes = layoutClusterInDirection(
+    const { nodes, notes } = layoutClusterInDirection(
       comp,
       compEdges,
       resolved.direction,
       resolved.exactDecross,
       clusterGap(compEdges, opts)
     );
-    return { nodes, edges: assignSidesByGeometry(nodes, compEdges) };
+    return { nodes, edges: assignSidesByGeometry(nodes, compEdges), notes };
   };
 
   const colaVariant = (base: LaidComponent[], opts: CleanOptions): LaidComponent[] =>
@@ -496,7 +496,7 @@ export function dagcolaLayout(
         opts.padding
       );
       const nodes = keepApart(refined, cluster.nodes, cluster.edges);
-      return { nodes, edges: assignSidesByGeometry(nodes, cluster.edges) };
+      return { nodes, edges: assignSidesByGeometry(nodes, cluster.edges), notes: cluster.notes };
     });
 
   const candidates: Candidate[] = [];
@@ -512,7 +512,8 @@ export function dagcolaLayout(
     }
   }
 
-  const debug = typeof process !== "undefined" && !!process.env?.DAGCOLA_DEBUG;
+  const debug =
+    resolved.clean.debug ?? (typeof process !== "undefined" && !!process.env?.DAGCOLA_DEBUG);
   let best: { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport } | null = null;
   let bestArea = 0;
   let chosen = "";

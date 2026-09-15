@@ -2,7 +2,7 @@ import type { AllCanvasNodeData, CanvasEdgeData, NodeSide } from "./Canvas.d";
 import type { PackOptions } from "./pack";
 import { maxRectsPack } from "./pack";
 import { connectedComponents, pointForSide, segmentIntersectsRect } from "./graph";
-import { DEFAULT_EXACT_DECROSS, clusterGap, layoutClusterInDirection } from "./daglayout";
+import { DEFAULT_EXACT_DECROSS, clusterGap, layoutClusterInDirection, LayoutEngineError } from "./daglayout";
 export { DEFAULT_EXACT_DECROSS, MAX_EXACT_DECROSS, SIMPLEX_LIMIT } from "./daglayout";
 
 /**
@@ -55,6 +55,8 @@ export interface CleanOptions {
    * exponential). Larger clusters fall back to the two-layer heuristic.
    */
   exactDecrossThreshold: number;
+  /** Emit per-pass refinement diagnostics to the console. */
+  debug?: boolean;
 }
 
 export const DEFAULT_CLEAN_OPTIONS: CleanOptions = {
@@ -87,6 +89,8 @@ export interface CleanReport {
   crossingFreeComponents: number;
   /** Group nodes repositioned to wrap their members. */
   groups: number;
+  /** Layout notes, e.g. a balanced fallback reason the user should see. */
+  notes?: string[];
 }
 
 /* ────────────────────────────── geometry ────────────────────────────── */
@@ -188,8 +192,7 @@ function edgeSegment(
 }
 
 function labelText(edge: CanvasEdgeData): string {
-  const l = (edge as { label?: unknown }).label;
-  return typeof l === "string" ? l : "";
+  return typeof edge.label === "string" ? edge.label : "";
 }
 
 function labelBoxFromSegment(seg: Segment, label: string, pad = 8): Rect {
@@ -223,6 +226,7 @@ function edgesCross(s1: Segment, s2: Segment): boolean {
  * as bad as a crossing — a strict intersection test misses them entirely, which
  * is exactly how several parallel chords end up drawn on top of each other.
  */
+const COLLINEAR_OVERLAP_MIN_PX = 2;
 function segmentsCollinearOverlap(p1: Pt, p2: Pt, p3: Pt, p4: Pt): boolean {
   if (orient(p1, p2, p3) !== 0 || orient(p1, p2, p4) !== 0) return false;
   const useX = Math.abs(p2.x - p1.x) >= Math.abs(p2.y - p1.y);
@@ -231,7 +235,7 @@ function segmentsCollinearOverlap(p1: Pt, p2: Pt, p3: Pt, p4: Pt): boolean {
   const b1 = useX ? p3.x : p3.y;
   const b2 = useX ? p4.x : p4.y;
   const overlap = Math.min(Math.max(a1, a2), Math.max(b1, b2)) - Math.max(Math.min(a1, a2), Math.min(b1, b2));
-  return overlap > 2;
+  return overlap > COLLINEAR_OVERLAP_MIN_PX;
 }
 
 function countCrossings(nodes: AllCanvasNodeData[], edges: CanvasEdgeData[]): number {
@@ -426,6 +430,7 @@ function reduceCrossings(
 interface ComponentResult {
   nodes: AllCanvasNodeData[];
   edges: CanvasEdgeData[];
+  notes: string[];
 }
 
 function layoutComponent(
@@ -434,18 +439,19 @@ function layoutComponent(
   opts: CleanOptions
 ): ComponentResult {
   if (compNodes.length === 0) {
-    return { nodes: [], edges: [] };
+    return { nodes: [], edges: [], notes: [] };
   }
   if (compNodes.length === 1) {
     const n = compNodes[0]!;
     return {
       nodes: [{ ...n, x: 0, y: 0 } as AllCanvasNodeData],
       edges: assignSidesByGeometry([{ ...n, x: 0, y: 0 } as AllCanvasNodeData], compEdges),
+      notes: [],
     };
   }
 
   // d3-dag Sugiyama layout in the requested direction (shared with DagCola).
-  const nodes = layoutClusterInDirection(
+  const { nodes: laid, notes } = layoutClusterInDirection(
     compNodes,
     compEdges,
     opts.direction,
@@ -454,7 +460,7 @@ function layoutComponent(
   );
 
   // Assign edge sides based on geometry
-  let edges = assignSidesByGeometry(nodes, compEdges);
+  let edges = assignSidesByGeometry(laid, compEdges);
 
   // The d3-dag layout already minimises crossings optimally (for small graphs)
   // or with a good heuristic (for larger graphs). The local search runs on top
@@ -464,18 +470,57 @@ function layoutComponent(
   if (opts.reduceCrossings) {
     const vertical = opts.direction !== "left-to-right";
     const depthOf = new Map<string, number>();
-    for (const n of nodes) depthOf.set(n.id, vertical ? Math.round(n.y) : Math.round(n.x));
-    const refinedNodes = reduceCrossings(nodes, edges, depthOf, vertical, opts.gap, opts.maxPasses);
+    for (const n of laid) depthOf.set(n.id, vertical ? Math.round(n.y) : Math.round(n.x));
+    const refinedNodes = reduceCrossings(laid, edges, depthOf, vertical, opts.gap, opts.maxPasses);
     edges = assignSidesByGeometry(refinedNodes, compEdges);
-    return { nodes: refinedNodes, edges };
+    return { nodes: refinedNodes, edges, notes };
   }
 
-  return { nodes, edges };
+  return { nodes: laid, edges, notes };
 }
 
 /* ───────────────────────────── label placement ──────────────────────── */
 
 const SIDE_CHOICES: Side[] = ["top", "bottom", "left", "right"];
+
+/**
+ * Per-label placement weights (used by `placeLabelsGlobally`, which scores each
+ * candidate side pair for one label at a time). Priority, highest to lowest:
+ * 1. the label (or its edge) on top of a card
+ * 2. the label on top of an already-reserved label
+ * 3. the label on top of another connection
+ * 4. introducing a crossing
+ * 5. edge length (weak tie-breaker)
+ */
+const PLACE_WEIGHTS = {
+  labelOnCard: 4000,
+  labelOnReserved: 1500,
+  labelOnEdge: 400,
+  crossing: 30,
+  lengthPerUnit: 0.02,
+} as const;
+
+/**
+ * Global layout cost weights (used by `refineLayout`'s `layoutCost`, which
+ * scores whole layouts). Each tier must dominate the sum of every lower tier so
+ * a fix to a high-priority problem can never be traded away for several
+ * low-priority wins. Priority, highest to lowest:
+ * 1. card/card overlap
+ * 2. connection behind a card
+ * 3. label on a card
+ * 4. label on another connection
+ * 5. connection crossing
+ * 6. displacement from the clean layout + sprawl (tie-breakers)
+ */
+export const COST_WEIGHTS = {
+  cardOverlap: 60000,
+  edgeBehindCard: 30000,
+  labelOverCard: 8000,
+  labelOnEdge: 3000,
+  edgeCrossing: 2500,
+  displacementPerUnit: 12,
+  sprawlPerUnit: 1.5,
+} as const;
 
 /**
  * Choose per-edge sides so labels sit in clear space. Candidates that would
@@ -555,11 +600,11 @@ function placeLabelsGlobally(
       }
 
       const value =
-        4000 * cardHits +
-        1500 * reservedHits +
-        400 * edgeHits +
-        30 * crossings +
-        Math.hypot(seg.b.x - seg.a.x, seg.b.y - seg.a.y) * 0.02;
+        PLACE_WEIGHTS.labelOnCard * cardHits +
+        PLACE_WEIGHTS.labelOnReserved * reservedHits +
+        PLACE_WEIGHTS.labelOnEdge * edgeHits +
+        PLACE_WEIGHTS.crossing * crossings +
+        Math.hypot(seg.b.x - seg.a.x, seg.b.y - seg.a.y) * PLACE_WEIGHTS.lengthPerUnit;
       return { value, crossings, box };
     };
 
@@ -691,7 +736,7 @@ function layoutCost(
   // Card/card overlap — effectively forbidden.
   for (let i = 0; i < nodes.length; i++)
     for (let j = i + 1; j < nodes.length; j++)
-      if (rectsOverlap(toRect(nodes[i]!), toRect(nodes[j]!))) cost += 60000;
+      if (rectsOverlap(toRect(nodes[i]!), toRect(nodes[j]!))) cost += COST_WEIGHTS.cardOverlap;
 
   // Connection passing behind an unrelated card — priority #1, weighted far
   // above crossings so a hidden edge is always eliminated even at the cost of a
@@ -701,7 +746,7 @@ function layoutCost(
     for (const n of nodes) {
       if (n.type === "group" || n.id === s.fromId || n.id === s.toId) continue;
       if (segmentIntersectsRect(s.a.x, s.a.y, s.b.x, s.b.y, n.x, n.y, n.width, n.height))
-        cost += 30000;
+        cost += COST_WEIGHTS.edgeBehindCard;
     }
   }
 
@@ -711,7 +756,7 @@ function layoutCost(
     if (!si) continue;
     for (let j = i + 1; j < segs.length; j++) {
       const sj = segs[j];
-      if (sj && edgesCross(si, sj)) cost += 2500;
+      if (sj && edgesCross(si, sj)) cost += COST_WEIGHTS.edgeCrossing;
     }
   }
 
@@ -724,14 +769,14 @@ function layoutCost(
     const box = labelBoxFromSegment(s, label);
     for (const n of nodes) {
       if (n.type === "group") continue;
-      if (rectsOverlap(box, toRect(n))) cost += 8000;
+      if (rectsOverlap(box, toRect(n))) cost += COST_WEIGHTS.labelOverCard;
     }
     for (let j = 0; j < edges.length; j++) {
       if (j === i) continue;
       const s2 = segs[j];
       if (!s2) continue;
       if (segmentIntersectsRect(s2.a.x, s2.a.y, s2.b.x, s2.b.y, box.x, box.y, box.width, box.height))
-        cost += 3000;
+        cost += COST_WEIGHTS.labelOnEdge;
     }
   }
 
@@ -747,10 +792,10 @@ function layoutCost(
     maxY = Math.max(maxY, n.y + n.height);
     if (base) {
       const b = base.get(n.id);
-      if (b) cost += 12 * (Math.abs(n.x - b.x) + Math.abs(n.y - b.y));
+      if (b) cost += COST_WEIGHTS.displacementPerUnit * (Math.abs(n.x - b.x) + Math.abs(n.y - b.y));
     }
   }
-  if (Number.isFinite(minX)) cost += (maxX - minX + maxY - minY) * 1.5;
+  if (Number.isFinite(minX)) cost += (maxX - minX + maxY - minY) * COST_WEIGHTS.sprawlPerUnit;
   return cost;
 }
 
@@ -830,6 +875,12 @@ function layoutMetrics(
  * Candidate card moves that could remove a connection (or label) from behind a
  * card: for every obstacle card intersected by an edge, its exact perpendicular
  * clearance plus axis-aligned (up/down/left/right) variants. Deduplicated.
+ *
+ * The obstacle lookup is spatial-grid accelerated: cards are indexed into the
+ * grid cells they span once per call, and each edge segment (or label box) only
+ * tests cards in the cells its own bounding box spans. That turns the O(E×N)
+ * scan into O(E×k) with k = cards-per-cell, which matters on large canvases
+ * because this runs once per refinement pass.
  */
 function clearanceMoves(
   out: AllCanvasNodeData[],
@@ -864,11 +915,50 @@ function clearanceMoves(
     }
   };
 
+  // Index every card into the grid cells it spans. A card that could intersect
+  // a segment/box is then guaranteed to be in a cell the query's bbox spans.
+  const CELL = 200;
+  const grid = new Map<string, AllCanvasNodeData[]>();
+  const cellKey = (cx: number, cy: number): string => `${cx}|${cy}`;
+  for (const n of out) {
+    const c0 = Math.floor(n.x / CELL);
+    const c1 = Math.floor((n.x + n.width) / CELL);
+    const r0 = Math.floor(n.y / CELL);
+    const r1 = Math.floor((n.y + n.height) / CELL);
+    for (let cx = c0; cx <= c1; cx++)
+      for (let cy = r0; cy <= r1; cy++) {
+        const k = cellKey(cx, cy);
+        const arr = grid.get(k);
+        if (arr) arr.push(n);
+        else grid.set(k, [n]);
+      }
+  }
+  const cardsInCells = (x1: number, y1: number, x2: number, y2: number): Iterable<AllCanvasNodeData> => {
+    const c0 = Math.floor(Math.min(x1, x2) / CELL);
+    const c1 = Math.floor(Math.max(x1, x2) / CELL);
+    const r0 = Math.floor(Math.min(y1, y2) / CELL);
+    const r1 = Math.floor(Math.max(y1, y2) / CELL);
+    const seen = new Set<AllCanvasNodeData>();
+    const acc: AllCanvasNodeData[] = [];
+    for (let cx = c0; cx <= c1; cx++)
+      for (let cy = r0; cy <= r1; cy++) {
+        const arr = grid.get(cellKey(cx, cy));
+        if (!arr) continue;
+        for (const n of arr) {
+          if (!seen.has(n)) {
+            seen.add(n);
+            acc.push(n);
+          }
+        }
+      }
+    return acc;
+  };
+
   for (const e of edges) {
     const seg = edgeSegment(e, nodeMap);
     if (!seg) continue;
     const label = labelText(e);
-    for (const n of out) {
+    for (const n of cardsInCells(seg.a.x, seg.a.y, seg.b.x, seg.b.y)) {
       if (n.type === "group" || n.id === e.fromNode || n.id === e.toNode) continue;
       if (
         segmentIntersectsRect(seg.a.x, seg.a.y, seg.b.x, seg.b.y, n.x, n.y, n.width, n.height)
@@ -885,7 +975,7 @@ function clearanceMoves(
       const px = -pdy / plen;
       const py = pdx / plen;
       const boxProjHalf = (Math.abs(box.width * px) + Math.abs(box.height * py)) / 2;
-      for (const n of out) {
+      for (const n of cardsInCells(box.x, box.y, box.x + box.width, box.y + box.height)) {
         if (n.type === "group" || n.id === e.fromNode || n.id === e.toNode) continue;
         if (!rectsOverlap(box, toRect(n))) continue;
         const d = perpClearDelta(n, seg.a, seg.b, boxProjHalf, margin);
@@ -908,7 +998,7 @@ function refineLayout(
   edges: CanvasEdgeData[],
   opts: CleanOptions
 ): AllCanvasNodeData[] {
-  const DEBUG = typeof process !== "undefined" && !!process.env?.CLEAN_REFINE_DEBUG;
+  const DEBUG = opts.debug ?? (typeof process !== "undefined" && !!process.env?.CLEAN_REFINE_DEBUG);
   const out = nodes.map((n) => ({ ...n })) as AllCanvasNodeData[];
   const base = new Map<string, { x: number; y: number }>();
   for (const n of out) base.set(n.id, { x: n.x, y: n.y });
@@ -1112,6 +1202,8 @@ function fitGroups(
 export interface LaidComponent {
   nodes: AllCanvasNodeData[];
   edges: CanvasEdgeData[];
+  /** Layout notes (e.g. a balanced fallback reason) to surface in the report. */
+  notes?: string[];
 }
 
 /**
@@ -1248,6 +1340,7 @@ export function layoutComponents(
   const orderedNodes = inputNodes.map((n) => byId.get(n.id) ?? n);
 
   const verified = verifyCleanLayout(orderedNodes, finalEdges, members);
+  const reportNotes = laidComponents.flatMap((c) => c.notes ?? []);
   const report: CleanReport = {
     nodes: orderedNodes.length,
     edges: finalEdges.length,
@@ -1256,6 +1349,7 @@ export function layoutComponents(
     groups: groups.length,
     ...verified,
   };
+  if (reportNotes.length > 0) report.notes = reportNotes;
 
   return { nodes: orderedNodes, edges: finalEdges, report };
 }
@@ -1279,7 +1373,8 @@ function runLayout(
   const laid: LaidComponent[] = components.map((comp) => {
     const ids = new Set(comp.map((n) => n.id));
     const compEdges = layoutEdges.filter((e) => ids.has(e.fromNode) && ids.has(e.toNode));
-    return layoutComponent(comp, compEdges, opts);
+    const result = layoutComponent(comp, compEdges, opts);
+    return { nodes: result.nodes, edges: result.edges, notes: result.notes };
   });
 
   return layoutComponents(inputNodes, inputEdges, components, laid, opts);
@@ -1364,7 +1459,10 @@ export function cleanLayout(
     let result: { nodes: AllCanvasNodeData[]; edges: CanvasEdgeData[]; report: CleanReport };
     try {
       result = runLayout(inputNodes, inputEdges, { ...opts, gap });
-    } catch {
+    } catch (err) {
+      // A real engine failure must surface, not be mistaken for a spacing trial
+      // that simply did not fit. Only skip a trial when the gap was the problem.
+      if (err instanceof LayoutEngineError) throw err;
       continue;
     }
     const area = bboxArea(result.nodes);
@@ -1384,8 +1482,9 @@ export function describeCleanReport(r: CleanReport): string {
     r.labelCardOverlaps === 0 &&
     r.labelLabelOverlaps === 0 &&
     r.labelEdgeHits === 0;
+  const notes = r.notes?.length ? ` (${r.notes.join("; ")})` : "";
   if (clean) {
-    return `Clean layout ✓ — ${r.nodes} cards, ${r.edges} connections, no overlaps and no crossings (${r.crossingFreeComponents}/${r.components} clusters fully clean).`;
+    return `Clean layout ✓ — ${r.nodes} cards, ${r.edges} connections, no overlaps and no crossings (${r.crossingFreeComponents}/${r.components} clusters fully clean).${notes}`;
   }
   const residual: string[] = [];
   if (r.edgeCrossings > 0) residual.push(`${r.edgeCrossings} connection crossing${r.edgeCrossings === 1 ? "" : "s"}`);
@@ -1393,5 +1492,5 @@ export function describeCleanReport(r: CleanReport): string {
   if (r.labelLabelOverlaps > 0) residual.push(`${r.labelLabelOverlaps} label/label overlap${r.labelLabelOverlaps === 1 ? "" : "s"}`);
   if (r.labelEdgeHits > 0) residual.push(`${r.labelEdgeHits} label crossing a connection`);
   if (r.edgeCardHits > 0) residual.push(`${r.edgeCardHits} connection behind a card`);
-  return `Clean layout: ${r.nodes} cards, ${r.edges} connections — ${r.crossingFreeComponents}/${r.components} clusters fully clean; residual: ${residual.join(", ")}.`;
+  return `Clean layout: ${r.nodes} cards, ${r.edges} connections — ${r.crossingFreeComponents}/${r.components} clusters fully clean; residual: ${residual.join(", ")}.${notes}`;
 }

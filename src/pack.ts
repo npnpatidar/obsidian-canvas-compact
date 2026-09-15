@@ -90,6 +90,8 @@ function splitFreeRects(freeRects: Rect[], placed: Rect): Rect[] {
 }
 
 function pruneFreeRects(rects: Rect[]): Rect[] {
+  // Nothing to remove for 0 or 1 rects; skip the O(n²) scan entirely.
+  if (rects.length < 2) return rects;
   // Remove rects contained within another
   const out: Rect[] = [];
   for (let i = 0; i < rects.length; i++) {
@@ -123,8 +125,10 @@ export function maxRectsPack(nodes: AllCanvasNodeData[], opts: PackOptions): All
   else {
     const totalArea = items.reduce((s, it) => s + it.w * it.h, 0);
     const maxW = Math.max(...items.map((it) => it.w));
-    // aim for ~ 6:4 aspect, width = sqrt(area * 1.4)
-    const est = Math.ceil(Math.sqrt(totalArea * 1.6));
+// Aim for a 1.6:1 width/height aspect-ratio bin: with area = w*h and w = a*h,
+// w = sqrt(area * a). Starting from a tall bin and growing downward, a wider bin
+// packs more items side by side and keeps the final shape squarish.
+const est = Math.ceil(Math.sqrt(totalArea * 1.6));
     binW = Math.max(maxW + pad * 2, Math.min(est, 2000));
     // round to 20
     binW = Math.ceil(binW / 20) * 20;
@@ -144,7 +148,6 @@ export function maxRectsPack(nodes: AllCanvasNodeData[], opts: PackOptions): All
     const w = it.w, h = it.h;
     let best: Rect | null = null;
     let bestScore = Infinity;
-    let bestIdx = -1;
     for (let i = 0; i < free.length; i++) {
       const fr = free[i]!;
       if (fr.width < w || fr.height < h) continue;
@@ -153,7 +156,6 @@ export function maxRectsPack(nodes: AllCanvasNodeData[], opts: PackOptions): All
       if (s < bestScore || (s === bestScore && best && (fr.y < best.y || (fr.y === best.y && fr.x < best.x)))) {
         bestScore = s;
         best = fr;
-        bestIdx = i;
       }
     }
     if (!best) {
@@ -164,9 +166,7 @@ export function maxRectsPack(nodes: AllCanvasNodeData[], opts: PackOptions): All
       binH += expand;
       // retry this item (simple: place at newFree origin)
       best = newFree;
-      bestIdx = free.length - 1;
     }
-    void bestIdx;
     const place: Rect = { x: best!.x, y: best!.y, width: w, height: h };
     posMap.set(it.node.id, { x: place.x, y: place.y });
     placed.push(place);
